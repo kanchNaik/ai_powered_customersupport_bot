@@ -64,7 +64,7 @@ export async function POST(req: Request) {
     const { searchParams } = new URL(req.url);
     const force = searchParams.get('force') === 'true';
 
-    const supabase = getAdminClient();
+    const supabase = admin();
 
     // Create a unique index on question to avoid duplicates (safe if it already exists)
     await supabase.rpc('exec_sql', {
