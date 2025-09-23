@@ -1,8 +1,7 @@
 // app/api/seed-faq/route.ts (or src/app/api/seed-faq/route.ts)
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
-
-export const runtime = 'edge'; // works well on Vercel
+export const runtime = 'nodejs';// works well on Vercel
 
 type FAQ = { question: string; answer: string };
 
@@ -39,13 +38,20 @@ const faqs: FAQ[] = [
   { question: "How do I contact support?", answer: "Use in-app chat (bottom-right), email support@yourdomain, or open a ticket from Help → Contact Support." },
 ];
 
-function getAdminClient() {
+function admin() {
   const url = process.env.SUPABASE_URL!;
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-  if (!url || !key) {
-    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
-  }
+  if (!url || !key) throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
   return createClient(url, key, { auth: { persistSession: false } });
+}
+
+export async function GET() {
+  return NextResponse.json({ ok: true, info: "POST here to seed FAQs." });
+}
+
+export async function OPTIONS() {
+  // In case a browser/fetch preflight hits OPTIONS, don’t 405
+  return new NextResponse(null, { status: 204 });
 }
 
 export async function POST(req: Request) {
@@ -94,9 +100,4 @@ export async function POST(req: Request) {
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e.message ?? 'Unknown error' }, { status: 500 });
   }
-}
-
-// Optional GET for quick check
-export async function GET() {
-  return NextResponse.json({ ok: true, info: "POST to this endpoint with x-seed-token to seed FAQs. Add ?force=true to overwrite." });
 }
