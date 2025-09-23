@@ -1,7 +1,7 @@
-// app/api/seed-faq/route.ts (or src/app/api/seed-faq/route.ts)
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
-export const runtime = 'nodejs';// works well on Vercel
+
+export const runtime = 'nodejs'; // simpler for seeding
 
 type FAQ = { question: string; answer: string };
 
@@ -46,55 +46,37 @@ function admin() {
 }
 
 export async function GET() {
-  return NextResponse.json({ ok: true, info: "POST here to seed FAQs." });
+  return NextResponse.json({ ok: true, info: "POST here to seed FAQs. Add ?force=true to replace existing rows." });
 }
 
 export async function OPTIONS() {
-  // In case a browser/fetch preflight hits OPTIONS, don’t 405
   return new NextResponse(null, { status: 204 });
 }
 
 export async function POST(req: Request) {
   try {
-    //const token = req.headers.get('x-seed-token');
-    //if (!process.env.SEED_TOKEN || token !== process.env.SEED_TOKEN) {
-      //return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
-    //}
-
+    const supabase = admin();
     const { searchParams } = new URL(req.url);
     const force = searchParams.get('force') === 'true';
 
-    const supabase = admin();
-
-    // Create a unique index on question to avoid duplicates (safe if it already exists)
-    await supabase.rpc('exec_sql', {
-      // We'll define this Postgres function below if you want; otherwise skip this block.
-      sql: "create unique index if not exists uniq_faq_question on faq ((lower(question)));"
-    }).catch(() => { /* ignore if RPC not set up */ });
-
-    // If table already has rows and not forcing, bail out
-    const { count, error: countErr } = await supabase
-      .from('faq')
-      .select('id', { count: 'exact', head: true });
-
-    if (countErr) {
-      return NextResponse.json({ ok: false, error: countErr.message }, { status: 500 });
-    }
-    if (!force && (count ?? 0) > 0) {
-      return NextResponse.json({ ok: true, skipped: true, reason: 'FAQ table already has data' });
-    }
-
-    // Upsert in chunks to be safe
-    const chunkSize = 15;
-    for (let i = 0; i < faqs.length; i += chunkSize) {
-      const chunk = faqs.slice(i, i + chunkSize);
-      const { error } = await supabase
+    // If force, wipe table first (service role bypasses RLS)
+    if (force) {
+      const { error: delErr } = await supabase.from('faq').delete().gte('id', 0);
+      if (delErr) return NextResponse.json({ ok: false, error: delErr.message }, { status: 500 });
+    } else {
+      // If not forcing and table has rows, skip
+      const { count, error: countErr } = await supabase
         .from('faq')
-        .upsert(chunk, { onConflict: 'question' });
-      if (error) {
-        return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
+        .select('id', { count: 'exact', head: true });
+      if (countErr) return NextResponse.json({ ok: false, error: countErr.message }, { status: 500 });
+      if ((count ?? 0) > 0) {
+        return NextResponse.json({ ok: true, skipped: true, reason: 'FAQ table already has data' });
       }
     }
+
+    // Insert fresh FAQs
+    const { error } = await supabase.from('faq').insert(faqs);
+    if (error) return NextResponse.json({ ok: false, error: error.message }, { status: 500 });
 
     return NextResponse.json({ ok: true, inserted: faqs.length, force });
   } catch (e: any) {
