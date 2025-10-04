@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { HfInference } from '@huggingface/inference';
-import Groq from 'groq-sdk';
 
 export const runtime = 'nodejs';
 
@@ -12,12 +11,14 @@ const DIMS = 384;
 // Retrieval
 const TOP_K = 5;
 const MIN_SIM = 0.30;   // minimum to consider relevant
-const STRONG_SIM = 0.45; // if below this, we’ll return “not confident”
+const STRONG_SIM = 0.45; // if below this, return “not confident”
 
 // LLM
-const LLM_MODEL = 'llama-3.1-8b-instant'; // fast + free-friendly
+const LLM_MODEL = 'llama-3.1-8b-instant'; // Groq
 
 const QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
+
+type MatchRow = { id: number; question: string; answer: string; similarity: number };
 
 function dbAnon() {
   const url = process.env.SUPABASE_URL!;
@@ -26,9 +27,9 @@ function dbAnon() {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
-function as1d(a: any): number[] {
-  if (Array.isArray(a) && typeof a[0] === 'number') return a.map(Number);
-  if (Array.isArray(a) && Array.isArray(a[0])) return (a[0] as any[]).map(Number);
+function as1d(a: unknown): number[] {
+  if (Array.isArray(a) && typeof a[0] === 'number') return (a as number[]).map(Number);
+  if (Array.isArray(a) && Array.isArray(a[0])) return (a[0] as number[]).map(Number);
   if (a instanceof Float32Array) return Array.from(a);
   if (Array.isArray(a) && a[0] instanceof Float32Array) return Array.from(a[0] as Float32Array);
   throw new Error('Unexpected embedding shape from HF');
@@ -40,7 +41,7 @@ async function embedQuery(q: string): Promise<number[]> {
   const data = await hf.featureExtraction({
     model: EMBED_MODEL,
     inputs: QUERY_PREFIX + q,
-    // @ts-ignore
+    // @ts-expect-error options supported by API
     options: { wait_for_model: true },
   });
   const vec = as1d(data);
@@ -48,10 +49,15 @@ async function embedQuery(q: string): Promise<number[]> {
   return vec;
 }
 
-function buildPrompt(userQ: string, passages: Array<{id:number, question:string, answer:string, similarity:number}>) {
-  const context = passages.map(p =>
-    `[FAQ-${p.id}] Q: ${p.question}\nA: ${p.answer}`
-  ).join('\n\n');
+// ---- If you're using Groq polishing from the previous step ----
+import Groq from 'groq-sdk';
+function buildPrompt(
+  userQ: string,
+  passages: Array<{ id: number; question: string; answer: string; similarity: number }>
+) {
+  const context = passages
+    .map((p) => `[FAQ-${p.id}] Q: ${p.question}\nA: ${p.answer}`)
+    .join('\n\n');
 
   return {
     system: `You are a support assistant. Answer ONLY using the provided FAQs.
@@ -65,19 +71,21 @@ Context FAQs:
 ${context}
 
 Instructions:
-1) Answer the user's question as accurately as possible using the context.
+1) Answer the user's question using the context.
 2) If unsure (context weak), say "I’m not fully sure" and list up to 3 relevant FAQs by id.
 3) Include citations like [FAQ-12] after claims grounded in a specific FAQ.`
   };
 }
 
-async function llmAnswer(userQ: string, ctx: Array<{id:number, question:string, answer:string, similarity:number}>) {
+async function llmAnswer(
+  userQ: string,
+  ctx: Array<{ id: number; question: string; answer: string; similarity: number }>
+) {
   if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY is missing');
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
   const { system, user } = buildPrompt(userQ, ctx);
-
   const chat = await groq.chat.completions.create({
-    model: LLM_MODEL,
+    model: 'llama-3.1-8b-instant',
     temperature: 0.2,
     max_tokens: 500,
     messages: [
@@ -85,7 +93,6 @@ async function llmAnswer(userQ: string, ctx: Array<{id:number, question:string, 
       { role: 'user', content: user },
     ],
   });
-
   return chat.choices?.[0]?.message?.content?.trim() ?? '';
 }
 
@@ -93,7 +100,7 @@ export async function GET() {
   return NextResponse.json({
     ok: true,
     usage: "POST JSON { question: 'How do I reset my password?' }",
-    note: "Embeds query (BGE) → pgvector match → LLM writes answer with [FAQ-id] citations."
+    note: "Embeds query (BGE) → pgvector match → optional Groq LLM with [FAQ-id] citations."
   });
 }
 
@@ -101,7 +108,9 @@ export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => null);
     const question = body?.question?.toString()?.trim();
-    if (!question) return NextResponse.json({ ok: false, error: "Provide JSON { question: '...' }" }, { status: 400 });
+    if (!question) {
+      return NextResponse.json({ ok: false, error: "Provide JSON { question: '...' }" }, { status: 400 });
+    }
 
     // 1) Embed query
     const qvec = await embedQuery(question);
@@ -115,12 +124,16 @@ export async function POST(req: Request) {
     });
     if (error) throw new Error(error.message);
 
-    const results = (data ?? []).map((r: any) => ({
-      id: r.id,
-      question: r.question,
-      answer: r.answer,
-      similarity: Number(r.similarity ?? 0),
-    })).sort((a,b) => b.similarity - a.similarity);
+    // Type results explicitly
+    const rows = (data ?? []) as MatchRow[];
+    const results: MatchRow[] = rows
+      .map((r) => ({
+        id: Number(r.id),
+        question: String(r.question),
+        answer: String(r.answer),
+        similarity: Number(r.similarity ?? 0),
+      }))
+      .sort((a: MatchRow, b: MatchRow) => b.similarity - a.similarity);
 
     const best = results[0];
     if (!best) {
@@ -138,8 +151,8 @@ export async function POST(req: Request) {
         ok: true,
         found: false,
         message: "I’m not fully sure based on the current FAQs.",
-        suggestions: results.slice(0, 3).map(r => ({
-          id: r.id, question: r.question, similarity: Number(r.similarity.toFixed(3))
+        suggestions: results.slice(0, 3).map((r) => ({
+          id: r.id, question: r.question, similarity: Number(r.similarity.toFixed(3)),
         })),
       });
     }
@@ -157,7 +170,7 @@ export async function POST(req: Request) {
         question: best.question,
         similarity: Number(best.similarity.toFixed(3)),
       },
-      sources: contextForLLM.map(r => ({
+      sources: contextForLLM.map((r) => ({
         id: r.id,
         question: r.question,
         similarity: Number(r.similarity.toFixed(3)),
