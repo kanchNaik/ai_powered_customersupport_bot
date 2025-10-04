@@ -7,6 +7,7 @@ export const runtime = 'nodejs';
 const MODEL = 'BAAI/bge-small-en-v1.5';
 const DIMS = 384;
 const BATCH = 16;
+const HF_URL = `https://api-inference.huggingface.co/pipeline/feature-extraction/${MODEL}`;
 
 function dbAdmin() {
   const url = process.env.SUPABASE_URL!;
@@ -15,42 +16,52 @@ function dbAdmin() {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
-function normalizeEmbeddings(out: any): number[][] {
+// keep inputs modest to avoid model/payload issues
+const truncate = (s: string, max = 1500) => (s.length > max ? s.slice(0, max) : s);
+
+function normOut(out: any): number[][] {
+  // HF feature-extraction returns number[] or number[][]
   if (Array.isArray(out) && typeof out[0] === 'number') return [out.map(Number)];
   if (Array.isArray(out) && Array.isArray(out[0]) && typeof out[0][0] === 'number') {
     return out.map((row: any[]) => row.map(Number));
   }
-  throw new Error('Unexpected embedding output shape from HF');
+  throw new Error('Unexpected HF output shape');
 }
 
-async function hfEmbed(inputs: string[]): Promise<number[][]> {
-  const r = await fetch(`https://api-inference.huggingface.co/models/${MODEL}`, {
+async function hfEmbed(texts: string[]): Promise<number[][]> {
+  const r = await fetch(HF_URL, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${process.env.HF_TOKEN}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ inputs, options: { wait_for_model: true } }),
+    body: JSON.stringify({ inputs: texts, options: { wait_for_model: true } }),
   });
+
   const body = await r.text().catch(() => '');
-  if (!r.ok) throw new Error(`HF ${MODEL} -> ${r.status} ${r.statusText}: ${body.slice(0, 300)}`);
+  if (!r.ok) throw new Error(`HF ${r.status} ${r.statusText}: ${body.slice(0, 400)}`);
+
   const json = body ? JSON.parse(body) : null;
-  const vecs = normalizeEmbeddings(json);
-  if (vecs[0]?.length !== DIMS) throw new Error(`HF ${MODEL} returned ${vecs[0]?.length} dims, expected ${DIMS}`);
-  return vecs.length === inputs.length ? vecs : Array(inputs.length).fill(vecs[0]);
+  const vecs = normOut(json);
+  if (vecs[0]?.length !== DIMS) {
+    throw new Error(`HF dims ${vecs[0]?.length} != expected ${DIMS}`);
+  }
+  return vecs.length === texts.length ? vecs : Array(texts.length).fill(vecs[0]);
 }
 
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    info: "POST to backfill embeddings for faq.embedding (vector(384)). Use ?force=true to recompute all.",
-    model: MODEL
+    info: 'POST to backfill faq.embedding (vector(384)). ?force=true recomputes all.',
+    model: MODEL,
   });
 }
 
 export async function POST(req: Request) {
   try {
-    if (!process.env.HF_TOKEN) return NextResponse.json({ ok: false, error: 'HF_TOKEN is missing' }, { status: 500 });
+    if (!process.env.HF_TOKEN) {
+      return NextResponse.json({ ok: false, error: 'HF_TOKEN is missing' }, { status: 500 });
+    }
 
     const supabase = dbAdmin();
     const { searchParams } = new URL(req.url);
@@ -69,8 +80,8 @@ export async function POST(req: Request) {
     if (error) throw new Error(error.message);
     if (!rows?.length) return NextResponse.json({ ok: true, updated: 0, note: 'Nothing to embed' });
 
-    // For documents, BGE does not need a special prefix
-    const texts = rows.map(r => `${r.question}\n${r.answer}`);
+    // BGE: no prefix needed for docs
+    const texts = rows.map(r => truncate(`${r.question}\n${r.answer}`, 1500));
 
     let updated = 0;
     for (let i = 0; i < texts.length; i += BATCH) {
@@ -78,7 +89,6 @@ export async function POST(req: Request) {
       const batchRows = rows.slice(i, i + BATCH);
 
       const vectors = await hfEmbed(batchTexts);
-
       for (let j = 0; j < batchRows.length; j++) {
         const { error: upErr } = await supabase
           .from('faq')
