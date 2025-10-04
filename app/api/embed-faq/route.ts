@@ -1,13 +1,12 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import { HfInference } from '@huggingface/inference';
 
 export const runtime = 'nodejs';
 
-// BGE (384-d)
-const MODEL = 'BAAI/bge-small-en-v1.5';
+const MODEL = 'BAAI/bge-small-en-v1.5'; // 384-d
 const DIMS = 384;
 const BATCH = 16;
-const HF_URL = `https://api-inference.huggingface.co/pipeline/feature-extraction/${MODEL}`;
 
 function dbAdmin() {
   const url = process.env.SUPABASE_URL!;
@@ -16,54 +15,31 @@ function dbAdmin() {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
-// keep inputs modest to avoid model/payload issues
 const truncate = (s: string, max = 1500) => (s.length > max ? s.slice(0, max) : s);
 
-function normOut(out: any): number[][] {
-  // HF feature-extraction returns number[] or number[][]
-  if (Array.isArray(out) && typeof out[0] === 'number') return [out.map(Number)];
-  if (Array.isArray(out) && Array.isArray(out[0]) && typeof out[0][0] === 'number') {
-    return out.map((row: any[]) => row.map(Number));
-  }
-  throw new Error('Unexpected HF output shape');
-}
-
-async function hfEmbed(texts: string[]): Promise<number[][]> {
-  const r = await fetch(HF_URL, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.HF_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ inputs: texts, options: { wait_for_model: true } }),
-  });
-
-  const body = await r.text().catch(() => '');
-  if (!r.ok) throw new Error(`HF ${r.status} ${r.statusText}: ${body.slice(0, 400)}`);
-
-  const json = body ? JSON.parse(body) : null;
-  const vecs = normOut(json);
-  if (vecs[0]?.length !== DIMS) {
-    throw new Error(`HF dims ${vecs[0]?.length} != expected ${DIMS}`);
-  }
-  return vecs.length === texts.length ? vecs : Array(texts.length).fill(vecs[0]);
+function as2d(a: any): number[][] {
+  // HF SDK returns Float32Array | Float32Array[] | number[] | number[][]
+  if (Array.isArray(a) && typeof a[0] === 'number') return [a.map(Number)];
+  if (Array.isArray(a) && Array.isArray(a[0])) return (a as any[]).map((row) => Array.from(row as any).map(Number));
+  if (a instanceof Float32Array) return [Array.from(a)];
+  if (Array.isArray(a) && a[0] instanceof Float32Array) return (a as any[]).map((row) => Array.from(row as Float32Array));
+  throw new Error('Unexpected embedding shape from HF');
 }
 
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    info: 'POST to backfill faq.embedding (vector(384)). ?force=true recomputes all.',
-    model: MODEL,
+    info: 'POST to backfill faq.embedding (vector(384)). Use ?force=true to recompute all.',
+    model: MODEL
   });
 }
 
 export async function POST(req: Request) {
   try {
-    if (!process.env.HF_TOKEN) {
-      return NextResponse.json({ ok: false, error: 'HF_TOKEN is missing' }, { status: 500 });
-    }
+    if (!process.env.HF_TOKEN) return NextResponse.json({ ok: false, error: 'HF_TOKEN is missing' }, { status: 500 });
 
     const supabase = dbAdmin();
+    const hf = new HfInference(process.env.HF_TOKEN);
     const { searchParams } = new URL(req.url);
     const force = searchParams.get('force') === 'true';
 
@@ -80,20 +56,28 @@ export async function POST(req: Request) {
     if (error) throw new Error(error.message);
     if (!rows?.length) return NextResponse.json({ ok: true, updated: 0, note: 'Nothing to embed' });
 
-    // BGE: no prefix needed for docs
-    const texts = rows.map(r => truncate(`${r.question}\n${r.answer}`, 1500));
+    const texts = rows.map((r) => truncate(`${r.question}\n${r.answer}`, 1500));
 
     let updated = 0;
     for (let i = 0; i < texts.length; i += BATCH) {
       const batchTexts = texts.slice(i, i + BATCH);
       const batchRows = rows.slice(i, i + BATCH);
 
-      const vectors = await hfEmbed(batchTexts);
+      // Pass an array of strings to get array-of-vectors back
+      const data = await hf.featureExtraction({
+        model: MODEL,
+        inputs: batchTexts,
+        // @ts-ignore – options is supported by the API
+        options: { wait_for_model: true },
+      });
+
+      const vectors = as2d(data);
+      if (!vectors[0] || vectors[0].length !== DIMS) {
+        throw new Error(`HF dims ${vectors[0]?.length} != expected ${DIMS}`);
+      }
+
       for (let j = 0; j < batchRows.length; j++) {
-        const { error: upErr } = await supabase
-          .from('faq')
-          .update({ embedding: vectors[j] })
-          .eq('id', batchRows[j].id);
+        const { error: upErr } = await supabase.from('faq').update({ embedding: vectors[j] }).eq('id', batchRows[j].id);
         if (upErr) throw new Error(upErr.message);
         updated++;
       }
