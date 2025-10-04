@@ -3,29 +3,10 @@ import { createClient } from '@supabase/supabase-js';
 
 export const runtime = 'nodejs';
 
-// Pick a small, free embedding model (384 dims)
-const MODEL = 'intfloat/e5-small-v2';
-
-// HF embedding call
-async function embed(text: string): Promise<number[]> {
-  const r = await fetch(`https://api-inference.huggingface.co/models/${MODEL}`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${process.env.HF_TOKEN}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      inputs: text,
-      options: { wait_for_model: true }
-    })
-  });
-  if (!r.ok) throw new Error(`HF error ${r.status} ${r.statusText}`);
-  const out = await r.json();
-  // HF can return [dim] or [[dim]]; normalize:
-  const vec = Array.isArray(out?.[0]) ? out[0] : out;
-  if (!Array.isArray(vec) || vec.length !== 384) throw new Error('Unexpected embedding shape');
-  return vec.map(Number);
-}
+// BGE (384-d)
+const MODEL = 'BAAI/bge-small-en-v1.5';
+const DIMS = 384;
+const BATCH = 16;
 
 function dbAdmin() {
   const url = process.env.SUPABASE_URL!;
@@ -34,45 +15,81 @@ function dbAdmin() {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
+function normalizeEmbeddings(out: any): number[][] {
+  if (Array.isArray(out) && typeof out[0] === 'number') return [out.map(Number)];
+  if (Array.isArray(out) && Array.isArray(out[0]) && typeof out[0][0] === 'number') {
+    return out.map((row: any[]) => row.map(Number));
+  }
+  throw new Error('Unexpected embedding output shape from HF');
+}
+
+async function hfEmbed(inputs: string[]): Promise<number[][]> {
+  const r = await fetch(`https://api-inference.huggingface.co/models/${MODEL}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.HF_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ inputs, options: { wait_for_model: true } }),
+  });
+  const body = await r.text().catch(() => '');
+  if (!r.ok) throw new Error(`HF ${MODEL} -> ${r.status} ${r.statusText}: ${body.slice(0, 300)}`);
+  const json = body ? JSON.parse(body) : null;
+  const vecs = normalizeEmbeddings(json);
+  if (vecs[0]?.length !== DIMS) throw new Error(`HF ${MODEL} returned ${vecs[0]?.length} dims, expected ${DIMS}`);
+  return vecs.length === inputs.length ? vecs : Array(inputs.length).fill(vecs[0]);
+}
+
 export async function GET() {
   return NextResponse.json({
     ok: true,
-    info: "POST here to backfill embeddings for all FAQs.",
-    tip: "Set HF_TOKEN in Vercel envs first. Use ?force=true to recompute all."
+    info: "POST to backfill embeddings for faq.embedding (vector(384)). Use ?force=true to recompute all.",
+    model: MODEL
   });
 }
 
 export async function POST(req: Request) {
   try {
+    if (!process.env.HF_TOKEN) return NextResponse.json({ ok: false, error: 'HF_TOKEN is missing' }, { status: 500 });
+
     const supabase = dbAdmin();
     const { searchParams } = new URL(req.url);
     const force = searchParams.get('force') === 'true';
 
-    // If force, clear existing embeddings
     if (force) {
       const { error: clr } = await supabase.from('faq').update({ embedding: null }).gte('id', 0);
       if (clr) throw new Error(clr.message);
     }
 
-    // Pull rows missing embeddings
     const { data: rows, error } = await supabase
-      .from('faq').select('id, question, answer').is('embedding', null).limit(1000);
+      .from('faq')
+      .select('id, question, answer')
+      .is('embedding', null)
+      .limit(2000);
     if (error) throw new Error(error.message);
     if (!rows?.length) return NextResponse.json({ ok: true, updated: 0, note: 'Nothing to embed' });
 
-    // e5 works best with instruction prefixes:
-    //   "passage: " for documents; "query: " for queries
-    // Here we embed doc text as "passage: question \n answer"
-    for (const row of rows) {
-      const text = `passage: ${row.question}\n${row.answer}`;
-      const vec = await embed(text);
-      const { error: upErr } = await supabase.from('faq')
-        .update({ embedding: vec })
-        .eq('id', row.id);
-      if (upErr) throw new Error(upErr.message);
+    // For documents, BGE does not need a special prefix
+    const texts = rows.map(r => `${r.question}\n${r.answer}`);
+
+    let updated = 0;
+    for (let i = 0; i < texts.length; i += BATCH) {
+      const batchTexts = texts.slice(i, i + BATCH);
+      const batchRows = rows.slice(i, i + BATCH);
+
+      const vectors = await hfEmbed(batchTexts);
+
+      for (let j = 0; j < batchRows.length; j++) {
+        const { error: upErr } = await supabase
+          .from('faq')
+          .update({ embedding: vectors[j] })
+          .eq('id', batchRows[j].id);
+        if (upErr) throw new Error(upErr.message);
+        updated++;
+      }
     }
 
-    return NextResponse.json({ ok: true, updated: rows.length });
+    return NextResponse.json({ ok: true, updated, model: MODEL });
   } catch (e: any) {
     return NextResponse.json({ ok: false, error: e?.message ?? 'Unknown error' }, { status: 500 });
   }
