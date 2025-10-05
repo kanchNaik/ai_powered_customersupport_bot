@@ -1,17 +1,19 @@
 'use client';
+
 import { useEffect, useState } from 'react';
 import { browserClient } from '@/lib/supabaseBrowser';
-import { Auth, ThemeSupa } from '@supabase/auth-ui-react';
+import { Auth } from '@supabase/auth-ui-react';
+import { ThemeSupa } from '@supabase/auth-ui-shared';
 
 export default function LoginPage() {
   const [supabase] = useState(() => browserClient());
-  const [emailSent, setEmailSent] = useState(false);
 
   useEffect(() => {
-    const { data: listener } = supabase.auth.onAuthStateChange((_e, _s) => {
-      // Next.js will pick up the session cookie; optionally redirect here
+    const { data: sub } = supabase.auth.onAuthStateChange(() => {
+      // you can redirect after sign-in if you want
+      // window.location.href = '/support';
     });
-    return () => listener.subscription.unsubscribe();
+    return () => sub.subscription.unsubscribe();
   }, [supabase]);
 
   return (
@@ -20,14 +22,10 @@ export default function LoginPage() {
       <Auth
         supabaseClient={supabase}
         appearance={{ theme: ThemeSupa }}
-        providers={['github']}
-        redirectTo={typeof window !== 'undefined' ? window.location.origin + '/support' : undefined}
-        magicLink
-        showLinks={true}
-        view="sign_in"
-        localization={{ variables: { sign_in: { email_label: 'Email (magic link)' } } }}
+        providers={['github']}      // remove if you don’t want OAuth
+        magicLink                   // enables email magic link
+        redirectTo={typeof window !== 'undefined' ? `${window.location.origin}/support` : undefined}
       />
-      {emailSent && <p className="mt-2 text-sm">Check your email for the magic link.</p>}
     </main>
   );
 }
