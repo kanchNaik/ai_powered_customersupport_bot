@@ -1,20 +1,16 @@
+// app/api/chat/route.ts
 import { NextResponse } from 'next/server';
-import { cookies } from 'next/headers';
-import { createServerClient } from '@supabase/ssr';
-import { dbAnon } from '@/lib/db';
+import { serverClient } from '@/lib/supabaseServer';
 import { retrieveMatches, isConfident } from '@/lib/retrieval';
 import { polishAnswer, askForClarification, summarizeForTicket } from '@/lib/llm';
 
 export const runtime = 'nodejs';
 
-function serverClient() {
-  const cookieStore = cookies();
-  return createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    { cookies: () => cookieStore }
-  );
-}
+type ChatPostBody = {
+  message?: string;
+  conversationId?: string;
+  forceTicket?: boolean;
+};
 
 function looksLikeTicketRequest(s: string) {
   const t = s.toLowerCase();
@@ -23,95 +19,144 @@ function looksLikeTicketRequest(s: string) {
 
 export async function POST(req: Request) {
   try {
-    const supaUser = serverClient();
-    const { data: { user } } = await supaUser.auth.getUser();
-    if (!user) return NextResponse.json({ ok:false, error:'Unauthorized' }, { status:401 });
+    // Auth (reads Supabase session from cookies via serverClient helper)
+    const supa = await serverClient();
+    const { data: { user } } = await supa.auth.getUser();
+    if (!user) return NextResponse.json({ ok: false, error: 'Unauthorized' }, { status: 401 });
 
-    const body = await req.json().catch(() => null);
+    const body = (await req.json().catch(() => ({}))) as ChatPostBody;
     const message = String(body?.message ?? '').trim();
-    let conversationId = String(body?.conversationId ?? '');
-    if (!message) return NextResponse.json({ ok:false, error:'Missing message' }, { status:400 });
+    let conversationId = String(body?.conversationId ?? '').trim();
 
-    // ensure conversation
+    if (!message) {
+      return NextResponse.json({ ok: false, error: 'Missing message' }, { status: 400 });
+    }
+
+    // Ensure a conversation row exists for this user
     if (!conversationId) {
-      const { data, error } = await supaUser.from('conversations')
+      const { data: conv, error: convErr } = await supa
+        .from('conversations')
         .insert({ user_id: user.id })
         .select('id')
         .single();
-      if (error) throw new Error(error.message);
-      conversationId = data!.id;
+      if (convErr) throw new Error(convErr.message);
+      conversationId = conv!.id as string;
     }
 
-    // append user message
-    const ins = await supaUser.from('messages').insert({
+    // Append the user's message
+    const ins = await supa.from('messages').insert({
       conversation_id: conversationId,
       role: 'user',
-      content: message
+      content: message,
     });
     if (ins.error) throw new Error(ins.error.message);
 
-    // ticket path
+    // Ticket creation path (explicit user intent or forced by client)
     if (looksLikeTicketRequest(message) || body?.forceTicket === true) {
-      const { data: hist, error: histErr } = await supaUser
-        .from('messages').select('role,content')
-        .eq('conversation_id', conversationId).order('id').limit(30);
+      const { data: hist, error: histErr } = await supa
+        .from('messages')
+        .select('role, content')
+        .eq('conversation_id', conversationId)
+        .order('id', { ascending: true })
+        .limit(50);
       if (histErr) throw new Error(histErr.message);
 
       const summary = await summarizeForTicket(hist ?? []);
-      const { data: ticket, error: tErr } = await supaUser
+      const { data: ticket, error: tErr } = await supa
         .from('tickets')
-        .insert({ conversation_id: conversationId, user_id: user.id,
-                  title: summary.title, summary: summary.summary, status: 'new', priority: 'normal' })
+        .insert({
+          conversation_id: conversationId,
+          user_id: user.id,
+          title: summary.title,
+          summary: summary.summary,
+          status: 'new',
+          priority: 'normal',
+        })
         .select('id, title, status, priority, created_at')
         .single();
       if (tErr) throw new Error(tErr.message);
 
-      await supaUser.from('messages').insert({
+      // Confirm in chat
+      await supa.from('messages').insert({
         conversation_id: conversationId,
         role: 'assistant',
-        content: `I've created ticket #${ticket.id}: ${ticket.title}.`
+        content: `I've created ticket #${ticket.id}: ${ticket.title}. Our team will follow up.`,
       });
 
       return NextResponse.json({
-        ok:true, conversationId, action:'ticket_created',
-        ticket, reply: `I've created ticket #${ticket.id}: ${ticket.title}.`
+        ok: true,
+        conversationId,
+        action: 'ticket_created',
+        ticket,
+        reply: `I've created ticket #${ticket.id}: ${ticket.title}.`,
       });
     }
 
-    // retrieval
+    // RAG retrieval (uses public RPC on faq; not tied to the user)
     const results = await retrieveMatches(message);
     const { ok: confident } = isConfident(results);
 
     if (confident) {
-      const ctx = results.slice(0,3);
+      const ctx = results.slice(0, 3);
       const reply = await polishAnswer(message, ctx);
-      await supaUser.from('messages').insert({ conversation_id: conversationId, role:'assistant', content: reply });
+
+      await supa.from('messages').insert({
+        conversation_id: conversationId,
+        role: 'assistant',
+        content: reply,
+      });
+
       return NextResponse.json({
-        ok:true, conversationId, action:'answer', reply,
-        sources: ctx.map(r=>({ id:r.id, similarity:+r.similarity.toFixed(3), question:r.question }))
+        ok: true,
+        conversationId,
+        action: 'answer',
+        reply,
+        sources: ctx.map((r) => ({
+          id: r.id,
+          question: r.question,
+          similarity: Number(r.similarity.toFixed(3)),
+        })),
       });
     }
 
-    // clarify
-    const follow = await askForClarification(message);
-    const reply = `${follow}\n\nIf you'd like, I can create a support ticket for you now — just say "create ticket".`;
-    await supaUser.from('messages').insert({ conversation_id: conversationId, role:'assistant', content: reply });
-    return NextResponse.json({
-      ok:true, conversationId, action:'clarify', reply,
-      suggestions: results.slice(0,3).map(r=>({ id:r.id, similarity:+r.similarity.toFixed(3), question:r.question }))
+    // Not confident → ask clarifying questions + offer ticket creation
+    const followup = await askForClarification(message);
+    const nudge =
+      `${followup}\n\n` +
+      `If you'd like, I can create a support ticket for you now — just say "create ticket".`;
+
+    await supa.from('messages').insert({
+      conversation_id: conversationId,
+      role: 'assistant',
+      content: nudge,
     });
-  } catch (e:any) {
-    return NextResponse.json({ ok:false, error: e?.message ?? 'Unknown error' }, { status:500 });
+
+    return NextResponse.json({
+      ok: true,
+      conversationId,
+      action: 'clarify',
+      reply: nudge,
+      suggestions: results.slice(0, 3).map((r) => ({
+        id: r.id,
+        question: r.question,
+        similarity: Number(r.similarity.toFixed(3)),
+      })),
+    });
+  } catch (e: any) {
+    return NextResponse.json(
+      { ok: false, error: e?.message ?? 'Unknown error' },
+      { status: 500 }
+    );
   }
 }
 
 export async function GET() {
   return NextResponse.json({
-    ok:true,
-    usage:{
-      start:`POST /api/chat { "message": "It is not working" }`,
-      continue:`POST /api/chat { "conversationId":"<uuid>", "message":"details..." }`,
-      ticket:`POST /api/chat { "conversationId":"<uuid>", "message":"create ticket" }`
-    }
+    ok: true,
+    usage: {
+      start: `POST /api/chat { "message": "It is not working" }`,
+      continue: `POST /api/chat { "conversationId": "<uuid>", "message": "More details..." }`,
+      ticket: `POST /api/chat { "conversationId": "<uuid>", "message": "create ticket" }`,
+    },
   });
 }
