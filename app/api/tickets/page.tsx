@@ -2,13 +2,15 @@ import { serverClient } from '@/lib/supabaseServer';
 import { redirect } from 'next/navigation';
 
 export default async function TicketsPage() {
-  const supa = serverClient();
+  const supa = await serverClient();                   // ⬅️ await
   const { data: { user } } = await supa.auth.getUser();
   if (!user) redirect('/login');
 
-  const { data, error } = await supa.from('tickets')
+  const { data, error } = await supa
+    .from('tickets')
     .select('id,title,status,priority,created_at')
-    .order('id', { ascending:false });
+    .order('id', { ascending: false });
+
   if (error) return <main className="p-6">Error: {error.message}</main>;
 
   return (
@@ -18,7 +20,9 @@ export default async function TicketsPage() {
         {(data ?? []).map(t => (
           <li key={t.id} className="border rounded p-3">
             <div className="font-medium">#{t.id} — {t.title}</div>
-            <div className="text-sm opacity-75">{t.status} • {t.priority} • {new Date(t.created_at).toLocaleString()}</div>
+            <div className="text-sm opacity-75">
+              {t.status} • {t.priority} • {new Date(t.created_at).toLocaleString()}
+            </div>
           </li>
         ))}
       </ul>
