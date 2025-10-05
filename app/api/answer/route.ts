@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 import { HfInference } from '@huggingface/inference';
+import Groq from 'groq-sdk';
 
 export const runtime = 'nodejs';
 
@@ -10,7 +11,7 @@ const DIMS = 384;
 
 // Retrieval
 const TOP_K = 5;
-const MIN_SIM = 0.30;   // minimum to consider relevant
+const MIN_SIM = 0.30;    // minimum to consider relevant
 const STRONG_SIM = 0.45; // if below this, return “not confident”
 
 // LLM
@@ -41,7 +42,6 @@ async function embedQuery(q: string): Promise<number[]> {
   const data = await hf.featureExtraction({
     model: EMBED_MODEL,
     inputs: QUERY_PREFIX + q,
-    // @ts-expect-error options supported by API
     options: { wait_for_model: true },
   });
   const vec = as1d(data);
@@ -49,8 +49,6 @@ async function embedQuery(q: string): Promise<number[]> {
   return vec;
 }
 
-// ---- If you're using Groq polishing from the previous step ----
-import Groq from 'groq-sdk';
 function buildPrompt(
   userQ: string,
   passages: Array<{ id: number; question: string; answer: string; similarity: number }>
@@ -85,7 +83,7 @@ async function llmAnswer(
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
   const { system, user } = buildPrompt(userQ, ctx);
   const chat = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
+    model: LLM_MODEL,
     temperature: 0.2,
     max_tokens: 500,
     messages: [
@@ -100,7 +98,7 @@ export async function GET() {
   return NextResponse.json({
     ok: true,
     usage: "POST JSON { question: 'How do I reset my password?' }",
-    note: "Embeds query (BGE) → pgvector match → optional Groq LLM with [FAQ-id] citations."
+    note: "Embeds query (BGE) → pgvector match → Groq LLM with [FAQ-id] citations."
   });
 }
 
@@ -124,7 +122,6 @@ export async function POST(req: Request) {
     });
     if (error) throw new Error(error.message);
 
-    // Type results explicitly
     const rows = (data ?? []) as MatchRow[];
     const results: MatchRow[] = rows
       .map((r) => ({
