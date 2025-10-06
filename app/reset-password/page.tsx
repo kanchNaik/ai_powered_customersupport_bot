@@ -1,6 +1,20 @@
 'use client';
+
+export const dynamic = 'force-dynamic'; // skip prerender
+export const runtime = 'edge';          // optional
+
 import { useEffect, useMemo, useState } from 'react';
 import { browserClient } from '@/lib/supabaseBrowser';
+
+function parseHash(hash: string) {
+  const qs = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
+  return {
+    access_token: qs.get('access_token') || undefined,
+    refresh_token: qs.get('refresh_token') || undefined,
+    type: qs.get('type') || undefined, // 'recovery' etc.
+    error: qs.get('error') || qs.get('error_description') || undefined,
+  };
+}
 
 export default function ResetPasswordPage() {
   const supabase = useMemo(() => browserClient(), []);
@@ -12,10 +26,46 @@ export default function ResetPasswordPage() {
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // Establish a session from the URL (code flow OR hash token flow)
   useEffect(() => {
-    // Give the client a tick to process the hash fragment and create a recovery session
-    const t = setTimeout(() => setReady(true), 300);
-    return () => clearTimeout(t);
+    (async () => {
+      try {
+        const href = window.location.href;
+        const url = new URL(href);
+        const code = url.searchParams.get('code'); // PKCE/OTP style
+        const { access_token, refresh_token, type, error } = parseHash(window.location.hash);
+
+        if (error) throw new Error(error);
+
+        if (code) {
+          // 1) Code flow
+          const { error: exErr } = await supabase.auth.exchangeCodeForSession(href);
+          if (exErr) throw exErr;
+        } else if (access_token && refresh_token) {
+          // 2) Hash token flow
+          const { error: setErr } = await supabase.auth.setSession({ access_token, refresh_token });
+          if (setErr) throw setErr;
+        } else {
+          // 3) If user already has a session from a previous step, use it
+          const { data: sessionData } = await supabase.auth.getSession();
+          if (!sessionData?.session) {
+            // 4) Some verify-only links won’t carry tokens; send user to login
+            if (type === 'signup' || type === 'email_change') {
+              setMsg('Email verified. Redirecting to sign in…');
+              setTimeout(() => window.location.replace('/login?verified=1'), 800);
+              return;
+            }
+            throw new Error('No auth tokens found in reset URL');
+          }
+        }
+
+        setReady(true);
+      } catch (e: any) {
+        console.error('[reset-password]', e?.message || e);
+        setErr('Auth session missing. Please open the reset link from your email again.');
+      }
+    })();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function onUpdate(e: React.FormEvent) {
@@ -23,8 +73,14 @@ export default function ResetPasswordPage() {
     setErr(null); setMsg(null); setLoading(true);
     try {
       if (!pw || pw !== confirm) throw new Error('Passwords do not match');
+
+      // Make sure we still have a session at submit time
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData?.session) throw new Error('Auth session missing');
+
       const { error } = await supabase.auth.updateUser({ password: pw });
       if (error) throw error;
+
       setMsg('Password updated. Redirecting to sign in…');
       setTimeout(() => { window.location.assign('/login'); }, 1200);
     } catch (e: any) {
@@ -37,23 +93,35 @@ export default function ResetPasswordPage() {
   return (
     <main className="mx-auto max-w-md p-6 space-y-4">
       <h1 className="text-2xl font-semibold">Set new password</h1>
-      {!ready && <div className="text-sm opacity-70">Preparing your reset session…</div>}
+
       {err && <div className="rounded border border-red-300 bg-red-50 p-2 text-sm text-red-700">{err}</div>}
       {msg && <div className="rounded border border-green-300 bg-green-50 p-2 text-sm text-green-700">{msg}</div>}
 
-      {ready && (
+      {!err && !ready && <div className="text-sm opacity-70">Preparing your reset session…</div>}
+
+      {ready && !err && (
         <form onSubmit={onUpdate} className="space-y-3">
           <div className="space-y-1">
             <label className="text-sm">New password</label>
-            <input className="w-full rounded border px-3 py-2" type={show ? 'text' : 'password'}
-              value={pw} onChange={e=>setPw(e.target.value)} required />
+            <input
+              className="w-full rounded border px-3 py-2"
+              type={show ? 'text' : 'password'}
+              value={pw}
+              onChange={e => setPw(e.target.value)}
+              required
+            />
           </div>
           <div className="space-y-1">
             <label className="text-sm">Confirm new password</label>
-            <input className="w-full rounded border px-3 py-2" type={show ? 'text' : 'password'}
-              value={confirm} onChange={e=>setConfirm(e.target.value)} required />
+            <input
+              className="w-full rounded border px-3 py-2"
+              type={show ? 'text' : 'password'}
+              value={confirm}
+              onChange={e => setConfirm(e.target.value)}
+              required
+            />
           </div>
-          <button type="button" className="rounded border px-2 text-sm" onClick={()=>setShow(s=>!s)}>
+          <button type="button" className="rounded border px-2 text-sm" onClick={() => setShow(s => !s)}>
             {show ? 'Hide' : 'Show'}
           </button>
           <div>
