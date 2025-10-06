@@ -1,20 +1,10 @@
+// app/reset-password/page.tsx
 'use client';
 
-export const dynamic = 'force-dynamic'; // skip prerender
-export const runtime = 'edge';          // optional
+export const dynamic = 'force-dynamic';
 
 import { useEffect, useMemo, useState } from 'react';
 import { browserClient } from '@/lib/supabaseBrowser';
-
-function parseHash(hash: string) {
-  const qs = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash);
-  return {
-    access_token: qs.get('access_token') || undefined,
-    refresh_token: qs.get('refresh_token') || undefined,
-    type: qs.get('type') || undefined, // 'recovery' etc.
-    error: qs.get('error') || qs.get('error_description') || undefined,
-  };
-}
 
 export default function ResetPasswordPage() {
   const supabase = useMemo(() => browserClient(), []);
@@ -26,46 +16,25 @@ export default function ResetPasswordPage() {
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
-  // Establish a session from the URL (code flow OR hash token flow)
   useEffect(() => {
     (async () => {
       try {
-        const href = window.location.href;
-        const url = new URL(href);
-        const code = url.searchParams.get('code'); // PKCE/OTP style
-        const { access_token, refresh_token, type, error } = parseHash(window.location.hash);
+        const href = window.location.href; // includes ?code=...
+        // 1) Exchange the code in the URL for a session
+        const { error: exErr } = await supabase.auth.exchangeCodeForSession(href);
+        if (exErr) throw exErr;
 
-        if (error) throw new Error(error);
-
-        if (code) {
-          // 1) Code flow
-          const { error: exErr } = await supabase.auth.exchangeCodeForSession(href);
-          if (exErr) throw exErr;
-        } else if (access_token && refresh_token) {
-          // 2) Hash token flow
-          const { error: setErr } = await supabase.auth.setSession({ access_token, refresh_token });
-          if (setErr) throw setErr;
-        } else {
-          // 3) If user already has a session from a previous step, use it
-          const { data: sessionData } = await supabase.auth.getSession();
-          if (!sessionData?.session) {
-            // 4) Some verify-only links won’t carry tokens; send user to login
-            if (type === 'signup' || type === 'email_change') {
-              setMsg('Email verified. Redirecting to sign in…');
-              setTimeout(() => window.location.replace('/login?verified=1'), 800);
-              return;
-            }
-            throw new Error('No auth tokens found in reset URL');
-          }
-        }
+        // 2) Verify we now have a session
+        const { data: s } = await supabase.auth.getSession();
+        if (!s?.session) throw new Error('Auth session missing after exchange');
 
         setReady(true);
       } catch (e: any) {
         console.error('[reset-password]', e?.message || e);
-        setErr('Auth session missing. Please open the reset link from your email again.');
+        setErr('Auth session missing. Please click the latest reset link from your email again.');
       }
     })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function onUpdate(e: React.FormEvent) {
@@ -74,15 +43,15 @@ export default function ResetPasswordPage() {
     try {
       if (!pw || pw !== confirm) throw new Error('Passwords do not match');
 
-      // Make sure we still have a session at submit time
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData?.session) throw new Error('Auth session missing');
+      // Must still have a session at submit time
+      const { data: s } = await supabase.auth.getSession();
+      if (!s?.session) throw new Error('Auth session missing');
 
       const { error } = await supabase.auth.updateUser({ password: pw });
       if (error) throw error;
 
       setMsg('Password updated. Redirecting to sign in…');
-      setTimeout(() => { window.location.assign('/login'); }, 1200);
+      setTimeout(() => window.location.assign('/login'), 1200);
     } catch (e: any) {
       setErr(e?.message || 'Failed to update password');
     } finally {
@@ -107,7 +76,7 @@ export default function ResetPasswordPage() {
               className="w-full rounded border px-3 py-2"
               type={show ? 'text' : 'password'}
               value={pw}
-              onChange={e => setPw(e.target.value)}
+              onChange={(e) => setPw(e.target.value)}
               required
             />
           </div>
@@ -117,7 +86,7 @@ export default function ResetPasswordPage() {
               className="w-full rounded border px-3 py-2"
               type={show ? 'text' : 'password'}
               value={confirm}
-              onChange={e => setConfirm(e.target.value)}
+              onChange={(e) => setConfirm(e.target.value)}
               required
             />
           </div>
