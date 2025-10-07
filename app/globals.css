@@ -1,26 +1,26 @@
 @import "tailwindcss";
 
+/* Accessible defaults + small UX niceties */
+:root { --ring: 0 0 0 3px rgba(99,102,241,.35); }
+html { color-scheme: light; }
+html.dark { color-scheme: dark; }
+
+/* Optional tokens if you want to use CSS vars in custom components */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #f8fafc;   /* light: slate-50 */
+  --foreground: #0f172a;   /* light: slate-900 */
+}
+html.dark {
+  --background: #0b1220;   /* dark: near slate-950 */
+  --foreground: #e2e8f0;   /* dark: slate-200 */
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+/* Base body styles rely on Tailwind colors (no white-on-white) */
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  @apply min-h-screen bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100;
 }
+
+/* Focus ring + nicer scrollbars */
+*:focus-visible { outline: none; box-shadow: var(--ring); }
+::-webkit-scrollbar { height: 10px; width: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(100,116,139,.5); border-radius: 999px; }
