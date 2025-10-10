@@ -1,16 +1,39 @@
 // lib/llm.ts
 import Groq from 'groq-sdk';
+import { HfInference } from '@huggingface/inference';
 
-/** ---------- Shared Types ---------- */
-export type Passage = {
-  id: number;
-  question: string;
-  answer: string;
-  similarity: number;
-};
+/** ========== Embeddings (HF: BGE small) ========== */
+export const EMBED_MODEL = 'BAAI/bge-small-en-v1.5';
+export const DIMS = 384;
+const QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
 
+function as1d(a: unknown): number[] {
+  if (Array.isArray(a) && typeof a[0] === 'number') return (a as number[]).map(Number);
+  if (Array.isArray(a) && Array.isArray(a[0])) return (a[0] as number[]).map(Number);
+  if (a instanceof Float32Array) return Array.from(a);
+  if (Array.isArray(a) && a[0] instanceof Float32Array) return Array.from(a[0] as Float32Array);
+  throw new Error('Unexpected embedding shape from HF');
+}
+
+export async function embedQuery(q: string): Promise<number[]> {
+  const key = process.env.HF_TOKEN;
+  if (!key) throw new Error('HF_TOKEN is missing');
+  const hf = new HfInference(key);
+  const data = await hf.featureExtraction({
+    model: EMBED_MODEL,
+    inputs: QUERY_PREFIX + q,
+    // @ts-expect-error: options are supported by the API
+    options: { wait_for_model: true },
+  });
+  const vec = as1d(data);
+  if (vec.length !== DIMS) throw new Error(`HF dims ${vec.length} != expected ${DIMS}`);
+  return vec;
+}
+
+/** ========== Shared Types ========== */
+export type MatchRow = { id: number; question: string; answer: string; similarity: number };
+export type Passage = { id: number; question: string; answer: string; similarity: number };
 export type ChatMsg = { role: 'user' | 'assistant'; content: string };
-
 export type TicketDraft = {
   title: string;
   summary: string; // final human-readable block (includes FAQ refs)
@@ -20,7 +43,7 @@ export type TicketDraft = {
   faq_refs?: number[];
 };
 
-/** ---------- Utilities ---------- */
+/** ========== Utils ========== */
 function parseJsonLoose(s: string): any {
   const fenced = /```json([\s\S]*?)```/i.exec(s);
   const raw = fenced ? fenced[1] : s;
@@ -49,13 +72,11 @@ function inferFaqRefsFromText(text: string): number[] {
 
 function inferFaqRefsFromChat(chat: ChatMsg[]): number[] {
   const set = new Set<number>();
-  for (const m of chat) {
-    for (const id of inferFaqRefsFromText(m.content)) set.add(id);
-  }
+  for (const m of chat) for (const id of inferFaqRefsFromText(m.content)) set.add(id);
   return [...set];
 }
 
-/** ---------- Answering with citations ---------- */
+/** ========== Answering with citations ========== */
 function buildAnswerPrompt(userQ: string, passages: Passage[]) {
   const context = passages
     .map(p => `[FAQ-${p.id}] Q: ${p.question}\nA: ${p.answer}`)
@@ -75,14 +96,11 @@ ${context}`;
   return { system, user };
 }
 
-/** Exported: generate a concise, cited answer. */
 export async function polishAnswer(userQ: string, passages: Passage[]): Promise<string> {
-  const hasGroq = !!process.env.GROQ_API_KEY;
   if (!passages?.length) return `I’m not fully sure based on the current FAQs.`;
 
-  // LLM path (preferred)
-  if (hasGroq) {
-    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY! });
+  if (process.env.GROQ_API_KEY) {
+    const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const { system, user } = buildAnswerPrompt(userQ, passages.slice(0, 3));
     const resp = await groq.chat.completions.create({
       model: 'llama-3.1-8b-instant',
@@ -97,17 +115,16 @@ export async function polishAnswer(userQ: string, passages: Passage[]): Promise<
     if (text) return text;
   }
 
-  // Fallback: stitch the top passage with a citation
+  // Fallback: stitch top passage with a citation
   const top = passages[0];
-  const cited = `${top.answer} [FAQ-${top.id}]`;
-  return cited;
+  return `${top.answer} [FAQ-${top.id}]`;
 }
 
-/** ---------- Clarifying question when confidence is low ---------- */
+/** ========== Clarifying question when confidence is low ========== */
 export async function askForClarification(userQ: string): Promise<string> {
   if (process.env.GROQ_API_KEY) {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-    const system = `Ask ONE short clarifying question to resolve the user's issue. 
+    const system = `Ask ONE short clarifying question to resolve the user's issue.
 No preamble. Keep it under 18 words.`;
     const user = `User said: "${userQ}"\nWhat is the single most useful follow-up question?`;
     const resp = await groq.chat.completions.create({
@@ -122,11 +139,10 @@ No preamble. Keep it under 18 words.`;
     const text = resp.choices?.[0]?.message?.content?.trim();
     if (text) return text.replace(/^[“"]|[”"]$/g, '');
   }
-  // Fallback generic follow-up
   return `Could you share a bit more detail (what you tried, exact error/message, and your account email)?`;
 }
 
-/** ---------- Ticket Summarization (with FAQ refs in summary) ---------- */
+/** ========== Ticket Summarization (with FAQ refs in summary) ========== */
 function heuristicTitle(chat: ChatMsg[]): string {
   const text = messagesToPlain(chat, 20).toLowerCase();
   if (text.includes('price adjustment')) return 'Price adjustment request within 7-day window';
@@ -151,7 +167,6 @@ function buildSummaryText(d: TicketDraft): string {
   return lines.join('\n');
 }
 
-/** Exported: summarize the conversation into a structured ticket draft. */
 export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> {
   const faqRefs = inferFaqRefsFromChat(chat);
   const base: TicketDraft = {
@@ -163,7 +178,6 @@ export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> 
     faq_refs: faqRefs,
   };
 
-  // If no LLM key, fallback but still include refs in the final summary
   if (!process.env.GROQ_API_KEY) {
     const tail = messagesToPlain(chat, 12);
     const draft: TicketDraft = {
@@ -235,7 +249,6 @@ Rules:
     faq_refs: mergedRefs,
   };
 
-  // Build the final human-friendly summary string INCLUDING FAQ refs
   draft.summary = buildSummaryText(draft);
   return draft;
 }
