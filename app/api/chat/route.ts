@@ -12,7 +12,7 @@ type ChatPostBody = {
   message?: string;
   conversationId?: string;
   forceTicket?: boolean;
-  history?: ChatMsg[];  // 👈 client can send local history when anonymous
+  history?: ChatMsg[]; // client can send local history when anonymous
 };
 
 function looksLikeTicketRequest(s: string) {
@@ -20,27 +20,35 @@ function looksLikeTicketRequest(s: string) {
   return /open.*ticket|create.*ticket|raise.*ticket|support ticket|file a ticket|escalate/.test(t);
 }
 
+function sevToPriority(sev?: string) {
+  if (sev === 'critical') return 'urgent';
+  if (sev === 'high') return 'high';
+  return 'normal';
+}
+
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as ChatPostBody;
     const message = String(body?.message ?? '').trim();
     let conversationId = String(body?.conversationId ?? '').trim();
-    const history = Array.isArray(body?.history) ? (body!.history as ChatMsg[]) : [];
+    const history = Array.isArray(body?.history) ? (body.history as ChatMsg[]) : [];
 
     if (!message) {
       return NextResponse.json({ ok: false, error: 'Missing message' }, { status: 400 });
     }
 
-    // Try to read user; do NOT require it for normal chat
+    // Try to read user; DO NOT require it for normal chat
     const supa = await serverClient();
-    const { data: { user } } = await supa.auth.getUser();
+    const {
+      data: { user },
+    } = await supa.auth.getUser();
 
     const wantsTicket = looksLikeTicketRequest(message) || body?.forceTicket === true;
 
     // ---------- ANONYMOUS PATH (no user) ----------
     if (!user) {
-      // Normal RAG answer (stateless)
       if (!wantsTicket) {
+        // Stateless RAG answer
         const results = await retrieveMatches(message);
         const { ok: confident } = isConfident(results);
 
@@ -52,38 +60,46 @@ export async function POST(req: Request) {
             conversationId: null,
             action: 'answer',
             reply,
-            sources: ctx.map(r => ({ id: r.id, question: r.question, similarity: Number(r.similarity.toFixed(3)) })),
+            sources: ctx.map((r) => ({
+              id: r.id,
+              question: r.question,
+              similarity: Number(r.similarity.toFixed(3)),
+            })),
           });
         } else {
           const followup = await askForClarification(message);
-          const nudge = `${followup}\n\nIf you'd like, I can create a support ticket — just click "Create ticket".`;
+          const nudge =
+            `${followup}\n\nIf you'd like, I can create a support ticket — just click "Create ticket".`;
           return NextResponse.json({
             ok: true,
             conversationId: null,
             action: 'clarify',
             reply: nudge,
-            suggestions: results.slice(0, 3).map(r => ({
-              id: r.id, question: r.question, similarity: Number(r.similarity.toFixed(3)),
+            suggestions: results.slice(0, 3).map((r) => ({
+              id: r.id,
+              question: r.question,
+              similarity: Number(r.similarity.toFixed(3)),
             })),
           });
         }
       }
 
-      // Ticket requested but not logged in → build a draft from local history + current msg
+      // Ticket requested but not logged in → summarize local history + current msg
       const anonHistory: ChatMsg[] = [...history, { role: 'user', content: message }];
-      const draft = await summarizeForTicket(anonHistory);
+      const draft = await summarizeForTicket(anonHistory); // { title, summary, severity, ... }
 
       return NextResponse.json({
         ok: true,
         action: 'login_required',
-        reply: 'Please sign in to create a ticket. You’ll be brought back here and I’ll finish the ticket automatically.',
-        loginUrl: '/login?next=/support&pending=ticket',
-        ticketDraft: draft, // { title, summary }
+        reply:
+          'Please sign in to create a ticket. You’ll be brought back here and I’ll finish the ticket automatically.',
+        loginUrl: '/login?next=/support&pending=ticket', // ⬅️ returns to /support after login
+        ticketDraft: { title: draft.title, summary: draft.summary },
       });
     }
 
     // ---------- AUTH’D PATH (user exists) ----------
-    // Ensure a conversation exists (optional: only if you want persistence for signed-in users)
+    // Ensure a conversation exists if you want persistence for signed-in users
     if (!conversationId) {
       const { data: conv, error: convErr } = await supa
         .from('conversations')
@@ -105,25 +121,25 @@ export async function POST(req: Request) {
     }
 
     if (wantsTicket) {
-      // Summarize from DB history (best source of truth)
+      // Summarize from full DB history for better accuracy
       const { data: hist, error: histErr } = await supa
         .from('messages')
         .select('role, content')
         .eq('conversation_id', conversationId)
         .order('id', { ascending: true })
-        .limit(100);
+        .limit(200);
       if (histErr) throw new Error(histErr.message);
 
-      const summary = await summarizeForTicket((hist ?? []) as ChatMsg[]);
+      const draft = await summarizeForTicket((hist ?? []) as ChatMsg[]);
       const { data: ticket, error: tErr } = await supa
         .from('tickets')
         .insert({
           conversation_id: conversationId,
           user_id: user.id,
-          title: summary.title,
-          summary: summary.summary,
+          title: draft.title,
+          summary: draft.summary, // includes "FAQ refs: #…" and steps/context
           status: 'new',
-          priority: 'normal',
+          priority: sevToPriority(draft.severity),
         })
         .select('id, title, status, priority, created_at')
         .single();
@@ -151,20 +167,29 @@ export async function POST(req: Request) {
     if (confident) {
       const ctx = results.slice(0, 3);
       const reply = await polishAnswer(message, ctx);
-      await supa.from('messages').insert({ conversation_id: conversationId, role: 'assistant', content: reply });
+      await supa
+        .from('messages')
+        .insert({ conversation_id: conversationId, role: 'assistant', content: reply });
 
       return NextResponse.json({
         ok: true,
         conversationId,
         action: 'answer',
         reply,
-        sources: ctx.map(r => ({ id: r.id, question: r.question, similarity: Number(r.similarity.toFixed(3)) })),
+        sources: ctx.map((r) => ({
+          id: r.id,
+          question: r.question,
+          similarity: Number(r.similarity.toFixed(3)),
+        })),
       });
     }
 
     const followup = await askForClarification(message);
-    const nudge = `${followup}\n\nIf you'd like, I can create a support ticket — just say "create ticket".`;
-    await supa.from('messages').insert({ conversation_id: conversationId, role: 'assistant', content: nudge });
+    const nudge =
+      `${followup}\n\nIf you'd like, I can create a support ticket — just say "create ticket".`;
+    await supa
+      .from('messages')
+      .insert({ conversation_id: conversationId, role: 'assistant', content: nudge });
 
     return NextResponse.json({
       ok: true,
