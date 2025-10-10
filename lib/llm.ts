@@ -1,96 +1,162 @@
 // lib/llm.ts
-import { HfInference } from '@huggingface/inference';
 import Groq from 'groq-sdk';
 
-export const EMBED_MODEL = 'BAAI/bge-small-en-v1.5';
-export const DIMS = 384;
-export const QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
+export type ChatMsg = { role: 'user' | 'assistant'; content: string };
 
-function as1d(a: unknown): number[] {
-  if (Array.isArray(a) && typeof a[0] === 'number') return (a as number[]).map(Number);
-  if (Array.isArray(a) && Array.isArray(a[0])) return (a[0] as number[]).map(Number);
-  if (a instanceof Float32Array) return Array.from(a);
-  if (Array.isArray(a) && a[0] instanceof Float32Array) return Array.from(a[0] as Float32Array);
-  throw new Error('Unexpected embedding shape from HF');
+export type TicketDraft = {
+  title: string;
+  summary: string;
+  severity?: 'low' | 'normal' | 'high' | 'critical';
+  environment?: string;
+  steps?: string[];
+  faq_refs?: number[];
+};
+
+function parseJsonLoose(s: string): any {
+  // Try fenced JSON first
+  const fence = /```json([\s\S]*?)```/i.exec(s);
+  const raw = fence ? fence[1] : s;
+  // Trim to first/last brace if needed
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  const slice = first >= 0 && last >= 0 ? raw.slice(first, last + 1) : raw;
+  try { return JSON.parse(slice); } catch { return null; }
 }
 
-export async function embedQuery(text: string): Promise<number[]> {
-  const token = process.env.HF_TOKEN!;
-  const hf = new HfInference(token);
-  const data = await hf.featureExtraction({
-    model: EMBED_MODEL,
-    inputs: QUERY_PREFIX + text,
-    options: { wait_for_model: true },
-  });
-  const vec = as1d(data);
-  if (vec.length !== DIMS) throw new Error(`HF dims ${vec.length} != expected ${DIMS}`);
-  return vec;
+function messagesToPlain(chat: ChatMsg[], limit = 50): string {
+  const tail = chat.slice(-limit);
+  return tail.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
 }
 
-export type MatchRow = { id: number; question: string; answer: string; similarity: number };
+function inferFaqRefs(chat: ChatMsg[]): number[] {
+  const set = new Set<number>();
+  for (const m of chat) {
+    const re = /\[FAQ-(\d+)\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(m.content)) !== null) {
+      set.add(Number(match[1]));
+    }
+  }
+  return [...set];
+}
 
-export function buildAnswerPrompt(userQ: string, ctx: MatchRow[]) {
-  const context = ctx.map(p => `[FAQ-${p.id}] Q: ${p.question}\nA: ${p.answer}`).join('\n\n');
-  return {
-    system: `You are a support assistant. Answer ONLY using the provided FAQs.
-- Be concise (<= 4 sentences).
-- Cite facts with [FAQ-<id>].
-- If unsure, say you're not fully sure and list up to 3 close FAQs.`,
-    user: `User question: ${userQ}\n\nContext FAQs:\n${context}`
+function heuristicTitle(chat: ChatMsg[]): string {
+  const text = messagesToPlain(chat, 20).toLowerCase();
+  if (text.includes('price adjustment')) return 'Price adjustment request within 7-day window';
+  if (text.includes('refund')) return 'Refund request';
+  if (text.includes('password')) return 'Password reset/login issue';
+  if (text.includes('2fa') || text.includes('two-factor')) return '2FA setup/verification issue';
+  if (text.includes('billing') || text.includes('invoice')) return 'Billing/invoice question';
+  return 'Support request';
+}
+
+function buildSummaryText(d: TicketDraft): string {
+  const lines: string[] = [];
+  lines.push(`Issue: ${d.title}`);
+  if (d.severity) lines.push(`Severity: ${d.severity}`);
+  if (d.environment) lines.push(`Environment: ${d.environment}`);
+  if (d.summary) lines.push('', d.summary.trim());
+  if (d.steps?.length) {
+    lines.push('', 'Steps / Context:');
+    for (const s of d.steps) lines.push(`- ${s}`);
+  }
+  if (d.faq_refs?.length) lines.push('', `FAQ refs: ${d.faq_refs.map(n => `#${n}`).join(', ')}`);
+  return lines.join('\n');
+}
+
+/**
+ * Summarize the conversation into a structured ticket.
+ * Falls back to heuristics if LLM fails.
+ */
+export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> {
+  const faqRefs = inferFaqRefs(chat);
+  const groqKey = process.env.GROQ_API_KEY;
+  const base: TicketDraft = {
+    title: heuristicTitle(chat),
+    summary: '',
+    severity: 'normal',
+    environment: undefined,
+    steps: [],
+    faq_refs: faqRefs,
   };
+
+  if (!groqKey) {
+    // Fallback summary if no LLM
+    const tail = messagesToPlain(chat, 12);
+    return {
+      ...base,
+      summary:
+        `Auto-summary (fallback):\n` +
+        `The user needs help related to: ${base.title}.\n` +
+        `Recent conversation:\n${tail}`,
+      steps: ['Review conversation log', 'Respond according to policy'],
+    };
+  }
+
+  const groq = new Groq({ apiKey: groqKey });
+  const convo = messagesToPlain(chat, 50);
+
+  const prompt = `
+You are creating an internal support ticket from the chat transcript below.
+Produce STRICT JSON with this shape:
+
+{
+  "title": "concise, specific issue (max 90 chars)",
+  "summary": "2-5 sentences: what the user needs, key constraints, any policy references",
+  "severity": "low|normal|high|critical",
+  "environment": "web|ios|android|api|unknown",
+  "steps": ["bullet 1", "bullet 2", "bullet 3"],
+  "faq_refs": [135, 209]
 }
 
-export async function polishAnswer(userQ: string, ctx: MatchRow[]): Promise<string> {
-  const apiKey = process.env.GROQ_API_KEY!;
-  const groq = new Groq({ apiKey });
-  const { system, user } = buildAnswerPrompt(userQ, ctx);
-  const chat = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
-    temperature: 0.2,
-    max_tokens: 500,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user',   content: user   },
-    ],
-  });
-  return chat.choices?.[0]?.message?.content?.trim() ?? '';
-}
+Rules:
+- Ground ONLY in the transcript; do not invent order IDs or dates.
+- If not stated, use "unknown" or omit.
+- Prefer a task-like title ("Price adjustment request within 7 days") over "Create new ticket".
+- Extract any FAQ ids mentioned like [FAQ-123] into faq_refs (unique, numeric).
+- If the user asked to "create ticket", include the preceding intent as context.
+- Keep JSON under 1200 chars.
+`;
 
-export async function askForClarification(userQ: string): Promise<string> {
-  const apiKey = process.env.GROQ_API_KEY!;
-  const groq = new Groq({ apiKey });
-  const system = `You are a support triage assistant. Ask for the minimum details to reproduce a problem. Return 1–2 short questions.`;
-  const user   = `User said: "${userQ}". Ask focused follow-ups (steps, exact error text, environment).`;
-  const chat = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
-    temperature: 0.2,
-    max_tokens: 120,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user',   content: user   },
-    ],
-  });
-  return chat.choices?.[0]?.message?.content?.trim() ?? 'Could you share exact steps, error message, and your browser/OS?';
-}
+  const messages = [
+    { role: 'system' as const, content: prompt.trim() },
+    { role: 'user' as const, content: `Transcript:\n${convo}` },
+  ];
 
-export async function summarizeForTicket(history: { role: string; content: string }[]) {
-  const apiKey = process.env.GROQ_API_KEY!;
-  const groq = new Groq({ apiKey });
-  const system = `You are an internal support tool. Produce a crisp ticket title and summary from chat.
-Title <= 12 words. Summary 4–8 bullet points (steps, error text, environment, severity). Return JSON { "title": "...", "summary": "..." }`;
-  const user = `Chat transcript:\n${history.map(m => `${m.role.toUpperCase()}: ${m.content}`).join('\n')}`;
-  const chat = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
-    temperature: 0.2,
-    max_tokens: 300,
-    messages: [
-      { role: 'system', content: system },
-      { role: 'user',   content: user   },
-    ],
-  });
-  const text = chat.choices?.[0]?.message?.content ?? '';
-  try { return JSON.parse(text); }
-  catch {
-    return { title: 'Support ticket from chat', summary: text.slice(0, 1000) };
+  try {
+    const resp = await groq.chat.completions.create({
+      model: 'llama-3.1-8b-instant',
+      temperature: 0.2,
+      max_tokens: 700,
+      messages,
+    });
+    const text = resp.choices?.[0]?.message?.content ?? '';
+    const obj = parseJsonLoose(text);
+
+    // Validate & merge with base
+    const draft: TicketDraft = {
+      ...base,
+      title: obj?.title || base.title,
+      summary: obj?.summary || base.summary,
+      severity: ['low', 'normal', 'high', 'critical'].includes(obj?.severity) ? obj.severity : base.severity,
+      environment: obj?.environment || 'unknown',
+      steps: Array.isArray(obj?.steps) ? obj.steps.slice(0, 10) : [],
+      faq_refs: Array.isArray(obj?.faq_refs) ? [...new Set(obj.faq_refs.map((n: any) => Number(n)).filter((n: number) => Number.isFinite(n)))] : faqRefs,
+    };
+
+    // Build a human-friendly summary block the agent will see
+    draft.summary = buildSummaryText(draft);
+    return draft;
+  } catch {
+    // LLM failure → sensible fallback
+    const tail = messagesToPlain(chat, 12);
+    return {
+      ...base,
+      summary:
+        `Auto-summary (fallback):\n` +
+        `The user needs help related to: ${base.title}.\n` +
+        `Recent conversation:\n${tail}`,
+      steps: ['Review conversation log', 'Respond according to policy'],
+    };
   }
 }
