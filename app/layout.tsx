@@ -2,6 +2,7 @@ import type { Metadata } from 'next';
 import './globals.css';
 import { Inter } from 'next/font/google';
 import ThemeToggle from './components/theme-toggle';  // ⬅️ use the client component
+import AuthButton from './components/auth-button';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -24,6 +25,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <a className="rounded px-3 py-1 hover:bg-slate-100 dark:hover:bg-slate-800" href="/support">Chat</a>
                 <a className="rounded px-3 py-1 hover:bg-slate-100 dark:hover:bg-slate-800" href="/dashboard">Dashboard</a>
                 <a className="rounded px-3 py-1 hover:bg-slate-100 dark:hover:bg-slate-800" href="/tickets">Tickets</a>
+                <AuthButton /> 
                 <ThemeToggle />
               </nav>
             </div>
