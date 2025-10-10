@@ -11,6 +11,8 @@ export async function middleware(req: NextRequest) {
   const PUBLIC_PATHS = new Set([
     '/login',
     '/reset-password',
+    '/support', 
+    '/api/chat', 
     '/auth/callback',
     '/api/answer',
     '/api/embed-faq',
