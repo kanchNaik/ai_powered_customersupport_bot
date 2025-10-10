@@ -20,11 +20,11 @@ export async function embedQuery(q: string): Promise<number[]> {
   if (!key) throw new Error('HF_TOKEN is missing');
   const hf = new HfInference(key);
   const data = await hf.featureExtraction({
-    model: EMBED_MODEL,
-    inputs: QUERY_PREFIX + q,
-    // @ts-expect-error: options are supported by the API
-    options: { wait_for_model: true },
-  });
+  model: EMBED_MODEL,
+  inputs: QUERY_PREFIX + q,
+  options: { wait_for_model: true }, // the types support this; no ts-expect-error needed
+});
+
   const vec = as1d(data);
   if (vec.length !== DIMS) throw new Error(`HF dims ${vec.length} != expected ${DIMS}`);
   return vec;
