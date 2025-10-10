@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import './globals.css';
 import { Inter } from 'next/font/google';
+import ThemeToggle from './components/theme-toggle';  // ⬅️ use the client component
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -29,7 +30,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           </header>
           <main className="mx-auto max-w-5xl px-4 py-6">{children}</main>
         </div>
-        {/* Prefer dark if OS says so, first paint */}
+
+        {/* Set initial theme at first paint */}
         <script
           dangerouslySetInnerHTML={{
             __html: `
@@ -38,27 +40,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 const c = localStorage.getItem('theme');
                 const dark = c ? c === 'dark' : m;
                 document.documentElement.classList.toggle('dark', dark);
-              } catch (e) {}
+              } catch {}
             `,
           }}
         />
       </body>
     </html>
-  );
-}
-
-function ThemeToggle() {
-  return (
-    <button
-      aria-label="Toggle theme"
-      className="rounded border border-slate-300 dark:border-slate-700 px-3 py-1 text-sm hover:bg-slate-100 dark:hover:bg-slate-800"
-      onClick={() => {
-        const el = document.documentElement;
-        const isDark = el.classList.toggle('dark');
-        try { localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch {}
-      }}
-    >
-      Theme
-    </button>
   );
 }
