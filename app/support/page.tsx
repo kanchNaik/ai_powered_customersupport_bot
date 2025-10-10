@@ -1,14 +1,18 @@
 // app/support/page.tsx
-import { serverClient } from '@/lib/supabaseServer';
+export const dynamic = 'force-dynamic'; // don't prerender, always render fresh
+
 import SupportChatClient from './support-client';
 
-export default async function SupportPage({ searchParams }: { searchParams: { conv?: string } }) {
-  const supabase = await serverClient();
-  const { data: { user } } = await supabase.auth.getUser(); // may be null (guest)
+export default function SupportPage({
+  searchParams,
+}: {
+  searchParams?: { conv?: string };
+}) {
+  const conv = searchParams?.conv ?? '';
   return (
-    <SupportChatClient
-      userId={user?.id ?? ''}                     // empty means guest
-      initialConversationId={searchParams.conv ?? ''}
-    />
+    <div className="mx-auto max-w-3xl space-y-4">
+      <h1 className="text-xl font-semibold">Support chat</h1>
+      <SupportChatClient initialConversationId={conv} />
+    </div>
   );
 }
