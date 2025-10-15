@@ -202,7 +202,7 @@ export default function SupportChatClient() {
   }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-[280px,minmax(0,1fr)] gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-[280px,minmax(0,1fr)] gap-4">
       {/* LEFT: Sidebar */}
       <aside className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 shadow-sm flex flex-col h-[80vh]">
         <div className="mb-3 flex items-center justify-between gap-2">
