@@ -135,6 +135,20 @@ export default function SupportChatClient() {
     didAutoOpen.current = true; // avoid auto-opening old convs right after New chat
   }
 
+  function lastByChars(msgs: ChatMsg[], maxChars = 8000): ChatMsg[] {
+  const out: ChatMsg[] = [];
+  let used = 0;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    const add = (m.content?.length || 0) + 12; // role + line breaks
+    if (used + add > maxChars && out.length) break;
+    out.unshift(m);
+    used += add;
+  }
+  return out;
+}
+  
+
   async function send(msg: string, forceTicket?: boolean) {
     const text = msg.trim();
     if (!text || loading) return;
@@ -144,18 +158,21 @@ export default function SupportChatClient() {
     setLoading(true);
 
     try {
-      const shortHistory = messages.slice(-20);
-      const res = await fetch('/api/chat', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          conversationId,
-          message: text,
-          forceTicket,
-          history: shortHistory,
-        }),
-      });
+      const historyToSend = forceTicket
+      ? lastByChars(messages, 12000)   // ~lots of context for summary
+      : lastByChars(messages, 3000);   // enough for follow-ups/answers
+
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        conversationId,
+        message: text,
+        forceTicket,
+        history: historyToSend,
+      }),
+    });
       const j = await res.json();
 
       // if server created a new conversation, store it & refresh list
