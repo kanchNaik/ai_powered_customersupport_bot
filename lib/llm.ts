@@ -2,7 +2,9 @@
 import Groq from 'groq-sdk';
 import { HfInference } from '@huggingface/inference';
 
-/** ========== Embeddings (HF: BGE small) ========== */
+/* =========================
+   Embeddings (HF: BGE small)
+   ========================= */
 export const EMBED_MODEL = 'BAAI/bge-small-en-v1.5';
 export const DIMS = 384;
 const QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
@@ -20,30 +22,34 @@ export async function embedQuery(q: string): Promise<number[]> {
   if (!key) throw new Error('HF_TOKEN is missing');
   const hf = new HfInference(key);
   const data = await hf.featureExtraction({
-  model: EMBED_MODEL,
-  inputs: QUERY_PREFIX + q,
-  options: { wait_for_model: true }, // the types support this; no ts-expect-error needed
-});
-
+    model: EMBED_MODEL,
+    inputs: QUERY_PREFIX + q,
+    // options is supported; no ts-ignore needed
+    options: { wait_for_model: true },
+  });
   const vec = as1d(data);
   if (vec.length !== DIMS) throw new Error(`HF dims ${vec.length} != expected ${DIMS}`);
   return vec;
 }
 
-/** ========== Shared Types ========== */
+/* ==============
+   Shared Types
+   ============== */
 export type MatchRow = { id: number; question: string; answer: string; similarity: number };
 export type Passage = { id: number; question: string; answer: string; similarity: number };
 export type ChatMsg = { role: 'user' | 'assistant'; content: string };
 export type TicketDraft = {
   title: string;
-  summary: string; // final human-readable block (includes FAQ refs)
+  summary: string;
   severity?: 'low' | 'normal' | 'high' | 'critical';
-  environment?: string;
+  environment?: 'web' | 'ios' | 'android' | 'api' | 'unknown';
   steps?: string[];
   faq_refs?: number[];
 };
 
-/** ========== Utils ========== */
+/* =========================
+   Small parsing / utilities
+   ========================= */
 function parseJsonLoose(s: string): any {
   const fenced = /```json([\s\S]*?)```/i.exec(s);
   const raw = fenced ? fenced[1] : s;
@@ -53,9 +59,13 @@ function parseJsonLoose(s: string): any {
   try { return JSON.parse(slice); } catch { return null; }
 }
 
+function toTranscript(chat: ChatMsg[]): string {
+  return chat.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
+}
+
 function messagesToPlain(chat: ChatMsg[], limit = 50): string {
   const tail = chat.slice(-limit);
-  return tail.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`).join('\n');
+  return toTranscript(tail);
 }
 
 function inferFaqRefsFromText(text: string): number[] {
@@ -76,7 +86,9 @@ function inferFaqRefsFromChat(chat: ChatMsg[]): number[] {
   return [...set];
 }
 
-/** ========== Answering with citations ========== */
+/* =========================
+   Answering (citations)
+   ========================= */
 function buildAnswerPrompt(userQ: string, passages: Passage[]) {
   const context = passages
     .map(p => `[FAQ-${p.id}] Q: ${p.question}\nA: ${p.answer}`)
@@ -96,6 +108,8 @@ ${context}`;
   return { system, user };
 }
 
+export const LLM_MODEL = 'llama-3.1-8b-instant'; // Groq
+
 export async function polishAnswer(userQ: string, passages: Passage[]): Promise<string> {
   if (!passages?.length) return `I’m not fully sure based on the current FAQs.`;
 
@@ -103,7 +117,7 @@ export async function polishAnswer(userQ: string, passages: Passage[]): Promise<
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
     const { system, user } = buildAnswerPrompt(userQ, passages.slice(0, 3));
     const resp = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
+      model: LLM_MODEL,
       temperature: 0.2,
       max_tokens: 500,
       messages: [
@@ -120,7 +134,6 @@ export async function polishAnswer(userQ: string, passages: Passage[]): Promise<
   return `${top.answer} [FAQ-${top.id}]`;
 }
 
-/** ========== Clarifying question when confidence is low ========== */
 export async function askForClarification(userQ: string): Promise<string> {
   if (process.env.GROQ_API_KEY) {
     const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -128,7 +141,7 @@ export async function askForClarification(userQ: string): Promise<string> {
 No preamble. Keep it under 18 words.`;
     const user = `User said: "${userQ}"\nWhat is the single most useful follow-up question?`;
     const resp = await groq.chat.completions.create({
-      model: 'llama-3.1-8b-instant',
+      model: LLM_MODEL,
       temperature: 0.2,
       max_tokens: 60,
       messages: [
@@ -142,7 +155,23 @@ No preamble. Keep it under 18 words.`;
   return `Could you share a bit more detail (what you tried, exact error/message, and your account email)?`;
 }
 
-/** ========== Ticket Summarization (with FAQ refs in summary) ========== */
+/* =========================
+   Ticket helpers
+   ========================= */
+function stripTicketCommands(chat: ChatMsg[]): ChatMsg[] {
+  const re = /(open|create|raise|file|escalate).{0,20}ticket|^create ticket$|^open ticket$/i;
+  return chat.filter(m => !re.test(m.content.toLowerCase()));
+}
+
+function inferEnvironment(chat: ChatMsg[]): 'web' | 'ios' | 'android' | 'api' | 'unknown' {
+  const text = chat.map(m => m.content.toLowerCase()).join('  ');
+  if (/ios|iphone|ipad|testflight|apple id|safari \(ios\)/.test(text)) return 'ios';
+  if (/android|apk|play store|pixel|samsung|chrome \(android\)/.test(text)) return 'android';
+  if (/api key|webhook|curl|endpoint|http 4\d\d|json|postman/.test(text)) return 'api';
+  if (/browser|chrome|safari|edge|firefox|desktop|laptop|web app/.test(text)) return 'web';
+  return 'unknown';
+}
+
 function heuristicTitle(chat: ChatMsg[]): string {
   const text = messagesToPlain(chat, 20).toLowerCase();
   if (text.includes('price adjustment')) return 'Price adjustment request within 7-day window';
@@ -167,16 +196,80 @@ function buildSummaryText(d: TicketDraft): string {
   return lines.join('\n');
 }
 
-// --- UPDATED ---
+/* =========================
+   Context packing for LLM
+   ========================= */
+const LLM_MAX_CONTEXT_TOKENS = 8000; // adjust if your Groq model supports more
+const LLM_TARGET_OUTPUT_TOKENS = 700;
+const SAFETY_TOKENS = 300;
+
+function estimateTokens(s: string): number {
+  return Math.ceil((s?.length || 0) / 4); // rough heuristic
+}
+
+async function summarizeHeadWithLLM(text: string): Promise<string> {
+  if (!process.env.GROQ_API_KEY) {
+    return text.slice(0, 4000) + '\n…';
+  }
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  const system = `
+You are compressing an earlier chat segment for a support ticket.
+Return 6-10 concise bullets capturing: problem, attempted steps, errors, constraints, and any [FAQ-123] refs you see.
+Do not add new facts. Keep exact numbers/IDs/FAQ refs. Keep under ~400 words.
+`.trim();
+  const resp = await groq.chat.completions.create({
+    model: LLM_MODEL,
+    temperature: 0.2,
+    max_tokens: 550,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: `Earlier chat to compress:\n${text}` },
+    ],
+  });
+  return resp.choices?.[0]?.message?.content?.trim() || text.slice(0, 4000);
+}
+
+/**
+ * Pack entire conversation up to the LLM input limit.
+ * - If it fits, pass full transcript.
+ * - If not, summarize the oldest ~70% and keep recent turns verbatim.
+ */
+export async function packConversationForLLM(fullChat: ChatMsg[]): Promise<string> {
+  const budget = LLM_MAX_CONTEXT_TOKENS - LLM_TARGET_OUTPUT_TOKENS - SAFETY_TOKENS;
+  const full = toTranscript(fullChat);
+  if (estimateTokens(full) <= budget) return full;
+
+  const splitIdx = Math.max(1, Math.floor(fullChat.length * 0.7));
+  const head = toTranscript(fullChat.slice(0, splitIdx));
+  const tail = toTranscript(fullChat.slice(splitIdx));
+  const headSummary = await summarizeHeadWithLLM(head);
+
+  let combined = `Conversation summary so far:\n${headSummary}\n\nRecent messages:\n${tail}`;
+  if (estimateTokens(combined) <= budget) return combined;
+
+  // If still too long, keep a suffix of recent messages that fits
+  const recent = fullChat.slice(splitIdx);
+  let lo = 0, hi = recent.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const candidate = `Conversation summary so far:\n${headSummary}\n\nRecent messages:\n` +
+      toTranscript(recent.slice(mid));
+    if (estimateTokens(candidate) > budget) lo = mid + 1;
+    else hi = mid;
+  }
+  return `Conversation summary so far:\n${headSummary}\n\nRecent messages:\n` +
+    toTranscript(recent.slice(hi));
+}
+
+/* =========================
+   Ticket summarization
+   ========================= */
 export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> {
-  // 1) Clean conversation (drop “create/open ticket” noise) + infer env
+  // Clean conversation and infer environment
   const cleaned = stripTicketCommands(chat);
   const envHint = inferEnvironment(cleaned);
-
-  // 2) Collect any FAQ refs already present in the chat
   const faqRefs = inferFaqRefsFromChat(cleaned);
 
-  // 3) Base draft (used for both fallback and LLM merge)
   const base: TicketDraft = {
     title: heuristicTitle(cleaned),
     summary: '',
@@ -186,28 +279,28 @@ export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> 
     faq_refs: faqRefs,
   };
 
-  // 4) Fallback path (no Groq key available)
+  // Fallback (no Groq): include full transcript (truncated by chars)
   if (!process.env.GROQ_API_KEY) {
-    const tail = messagesToPlain(cleaned, 12);
+    const transcript = toTranscript(cleaned);
     const draft: TicketDraft = {
       ...base,
       summary:
         `The user needs help related to: ${base.title}.\n\n` +
-        `Recent conversation:\n${tail}`,
+        `Recent conversation:\n${transcript.slice(0, 12000)}`,
       steps: ['Review conversation log', 'Respond according to policy'],
     };
-    draft.summary = buildSummaryText(draft); // human-friendly block incl. FAQ refs
+    draft.summary = buildSummaryText(draft);
     return draft;
   }
 
-  // 5) LLM path (concise, grounded JSON → merged into a readable summary)
-  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  const convo = messagesToPlain(cleaned, 50);
+  // Full conversation → pack if needed to fit model input
+  const convo = await packConversationForLLM(cleaned);
 
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
   const system = `
 Create an internal support ticket from the chat transcript.
 
-Return STRICT JSON ONLY (no extra text):
+Return STRICT JSON ONLY:
 {
   "title": "concise issue (max 90 chars)",
   "summary": "2-5 sentences: what the user needs, key constraints/policy context",
@@ -219,14 +312,14 @@ Return STRICT JSON ONLY (no extra text):
 
 Rules:
 - Ignore meta commands like "create/open ticket".
-- Ground ONLY in the transcript; do NOT invent order IDs, dates, or private data.
-- If environment is unclear, use "unknown" (you MAY infer from cues like 'browser', 'iOS', 'API key', etc.).
-- Extract FAQ numbers from tokens like [FAQ-123] into faq_refs (unique).
+- Ground ONLY in the transcript; do NOT invent order IDs or dates.
+- If environment is unclear, use "unknown" (you MAY infer from cues).
+- Extract [FAQ-123] numbers into faq_refs (unique).
 - Keep JSON under 1200 chars.
 `.trim();
 
   const resp = await groq.chat.completions.create({
-    model: 'llama-3.1-8b-instant',
+    model: LLM_MODEL,
     temperature: 0.2,
     max_tokens: 700,
     messages: [
@@ -238,7 +331,6 @@ Rules:
   const text = resp.choices?.[0]?.message?.content ?? '';
   const obj = parseJsonLoose(text) ?? {};
 
-  // Merge FAQ refs (dedupe)
   const mergedRefs = Array.from(
     new Set([
       ...faqRefs,
@@ -248,13 +340,13 @@ Rules:
     ])
   );
 
-  // Normalize severity & environment
-  const sev =
+  const sev: TicketDraft['severity'] =
     obj.severity && ['low', 'normal', 'high', 'critical'].includes(obj.severity)
-      ? (obj.severity as TicketDraft['severity'])
+      ? obj.severity
       : base.severity;
 
-  const env = (obj.environment as TicketDraft['environment']) || base.environment;
+  const env: TicketDraft['environment'] =
+    (obj.environment as TicketDraft['environment']) || base.environment;
 
   const draft: TicketDraft = {
     ...base,
@@ -266,24 +358,6 @@ Rules:
     faq_refs: mergedRefs,
   };
 
-  // Final human-readable block (Issue/Severity/Environment + summary + steps + FAQ refs)
   draft.summary = buildSummaryText(draft);
   return draft;
 }
-
-// lib/llm.ts — add these helpers near the top
-
-function stripTicketCommands(chat: ChatMsg[]): ChatMsg[] {
-  const re = /(open|create|raise|file|escalate).{0,20}ticket|^create ticket$|^open ticket$/i;
-  return chat.filter(m => !re.test(m.content.toLowerCase()));
-}
-
-function inferEnvironment(chat: ChatMsg[]): 'web' | 'ios' | 'android' | 'api' | 'unknown' {
-  const text = chat.map(m => m.content.toLowerCase()).join('  ');
-  if (/ios|iphone|ipad|testflight|apple id|safari \(ios\)/.test(text)) return 'ios';
-  if (/android|apk|play store|pixel|samsung|chrome \(android\)/.test(text)) return 'android';
-  if (/api key|webhook|curl|endpoint|http 4\d\d|json|postman/.test(text)) return 'api';
-  if (/browser|chrome|safari|edge|firefox|desktop|laptop|web app/.test(text)) return 'web';
-  return 'unknown';
-}
-
