@@ -152,8 +152,7 @@ export async function POST(req: Request) {
     .from('messages')
     .select('role, content')
     .eq('conversation_id', conversationId)
-    .order('id', { ascending: true })
-    .limit(500);
+    .order('id', { ascending: true });
   if (histErr) throw new Error(histErr.message);
 
   // Merge with client-sent history (helps when user chatted as guest before login)
