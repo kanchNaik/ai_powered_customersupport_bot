@@ -2,18 +2,18 @@
 import { NextResponse } from 'next/server';
 import { serverClient } from '@/lib/supabaseServer';
 import { retrieveMatches, isConfident } from '@/lib/retrieval';
-import { polishAnswer, askForClarification, summarizeForTicket } from '@/lib/llm';
+import {
+  polishAnswer,
+  askForClarification,
+  summarizeForTicket,
+} from '@/lib/llm';
+import type { ChatMsg } from '@/lib/llm';
 
 export const runtime = 'nodejs';
 
-type ChatMsg = { role: 'user' | 'assistant'; content: string };
-
-type ChatPostBody = {
-  message?: string;
-  conversationId?: string;
-  forceTicket?: boolean;
-  history?: ChatMsg[]; // client can send local history when anonymous
-};
+/* =========================
+   Helpers
+   ========================= */
 
 function looksLikeTicketRequest(s: string) {
   const t = s.toLowerCase();
@@ -26,38 +26,68 @@ function sevToPriority(sev?: string) {
   return 'normal';
 }
 
+// Supabase returns generic strings; normalize to 'user' | 'assistant'
+type DbMsg = { role: string; content: string };
+
+function asRole(r: string): 'user' | 'assistant' {
+  return r === 'assistant' ? 'assistant' : 'user';
+}
+
+function normalizeMsgs(arr: Array<DbMsg | ChatMsg>): ChatMsg[] {
+  return (arr || []).map((m: any) => ({
+    role: asRole(m.role),
+    content: String(m.content ?? '').trim(),
+  }));
+}
+
 const TICKET_INTENT_RE =
   /(open|create|raise|file|escalate).{0,20}ticket|^create ticket$|^open ticket$/i;
 
 function mergeAndCleanHistory(dbHist: ChatMsg[], clientHist: ChatMsg[]): ChatMsg[] {
-  // 1) merge
+  // merge
   const merged = [...(dbHist || []), ...(clientHist || [])];
 
-  // 2) dedupe by role+content
+  // de-duplicate by role+content (stable order)
   const seen = new Set<string>();
-  const deduped: ChatMsg[] = [];
+  const dedup: ChatMsg[] = [];
   for (const m of merged) {
-    const key = `${m.role}|${m.content.trim()}`;
+    const key = `${m.role}|${m.content}`;
     if (!seen.has(key)) {
       seen.add(key);
-      deduped.push({ role: m.role, content: m.content.trim() });
+      dedup.push(m);
     }
   }
 
-  // 3) drop pure “create/open ticket” commands so the LLM sees the real issue
-  const cleaned = deduped.filter(m => !TICKET_INTENT_RE.test(m.content.toLowerCase()));
+  // drop pure “create/open ticket” commands so the LLM sees the real issue
+  const cleaned = dedup.filter(m => !TICKET_INTENT_RE.test(m.content.toLowerCase()));
 
-  // 4) keep the last 60 turns max
-  return cleaned.slice(-60);
+  // IMPORTANT: no artificial cap — let the LLM packer handle long context
+  return cleaned;
 }
 
+/* =========================
+   Request body type
+   ========================= */
+type ChatPostBody = {
+  message?: string;
+  conversationId?: string;
+  forceTicket?: boolean;
+  // client may send generic strings; we normalize them to ChatMsg[]
+  history?: Array<{ role: string; content: string }>;
+};
 
+/* =========================
+   Handlers
+   ========================= */
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as ChatPostBody;
     const message = String(body?.message ?? '').trim();
     let conversationId = String(body?.conversationId ?? '').trim();
-    const history = Array.isArray(body?.history) ? (body.history as ChatMsg[]) : [];
+    // normalize client history to ChatMsg[]
+    const clientHistory: ChatMsg[] = normalizeMsgs(
+      Array.isArray(body?.history) ? body!.history : []
+    );
 
     if (!message) {
       return NextResponse.json({ ok: false, error: 'Missing message' }, { status: 400 });
@@ -65,13 +95,11 @@ export async function POST(req: Request) {
 
     // Try to read user; DO NOT require it for normal chat
     const supa = await serverClient();
-    const {
-      data: { user },
-    } = await supa.auth.getUser();
+    const { data: { user } } = await supa.auth.getUser();
 
     const wantsTicket = looksLikeTicketRequest(message) || body?.forceTicket === true;
 
-    // ---------- ANONYMOUS PATH (no user) ----------
+    /* ---------- ANONYMOUS PATH (no user) ---------- */
     if (!user) {
       if (!wantsTicket) {
         // Stateless RAG answer
@@ -111,7 +139,10 @@ export async function POST(req: Request) {
       }
 
       // Ticket requested but not logged in → summarize local history + current msg
-      const anonHistory: ChatMsg[] = [...history, { role: 'user', content: message }];
+      const anonHistory: ChatMsg[] = normalizeMsgs([
+        ...clientHistory,
+        { role: 'user', content: message },
+      ]);
       const draft = await summarizeForTicket(anonHistory); // { title, summary, severity, ... }
 
       return NextResponse.json({
@@ -119,12 +150,12 @@ export async function POST(req: Request) {
         action: 'login_required',
         reply:
           'Please sign in to create a ticket. You’ll be brought back here and I’ll finish the ticket automatically.',
-        loginUrl: '/login?next=/support&pending=ticket', // ⬅️ returns to /support after login
+        loginUrl: '/login?next=/support&pending=ticket', // returns to /support after login
         ticketDraft: { title: draft.title, summary: draft.summary },
       });
     }
 
-    // ---------- AUTH’D PATH (user exists) ----------
+    /* ---------- AUTH’D PATH (user exists) ---------- */
     // Ensure a conversation exists if you want persistence for signed-in users
     if (!conversationId) {
       const { data: conv, error: convErr } = await supa
@@ -146,53 +177,53 @@ export async function POST(req: Request) {
       if (ins.error) throw new Error(ins.error.message);
     }
 
+    // --- Create ticket flow (FULL history, normalized) ---
     if (wantsTicket) {
-  // Load DB history
-  const { data: hist, error: histErr } = await supa
-    .from('messages')
-    .select('role, content')
-    .eq('conversation_id', conversationId)
-    .order('id', { ascending: true });
-  if (histErr) throw new Error(histErr.message);
+      // Load FULL DB history (no limit)
+      const { data: hist, error: histErr } = await supa
+        .from('messages')
+        .select('role, content')
+        .eq('conversation_id', conversationId)
+        .order('id', { ascending: true });
+      if (histErr) throw new Error(histErr.message);
 
-  // Merge with client-sent history (helps when user chatted as guest before login)
-  const clientHist = Array.isArray(body?.history) ? (body.history as ChatMsg[]) : [];
-  const merged = mergeAndCleanHistory((hist ?? []) as ChatMsg[], clientHist);
+      const dbMsgs: ChatMsg[] = normalizeMsgs((hist ?? []) as DbMsg[]);
+      const merged: ChatMsg[] = mergeAndCleanHistory(dbMsgs, clientHistory);
 
-  // If merged is empty (edge case), fall back to at least the current message
-  const contextForTicket = merged.length ? merged : [{ role: 'user', content: message }];
+      // If merged is empty (edge case), fall back to at least the current message
+      const contextForTicket: ChatMsg[] =
+        merged.length ? merged : [{ role: 'user', content: message }];
 
-  const draft = await summarizeForTicket(contextForTicket);
+      const draft = await summarizeForTicket(contextForTicket);
 
-  const { data: ticket, error: tErr } = await supa
-    .from('tickets')
-    .insert({
-      conversation_id: conversationId,
-      user_id: user.id,
-      title: draft.title,
-      summary: draft.summary,     // includes steps + FAQ refs
-      status: 'new',
-      priority: (draft.severity === 'critical') ? 'urgent' :
-                (draft.severity === 'high')     ? 'high'   : 'normal',
-    })
-    .select('id, title, status, priority, created_at')
-    .single();
-  if (tErr) throw new Error(tErr.message);
+      const { data: ticket, error: tErr } = await supa
+        .from('tickets')
+        .insert({
+          conversation_id: conversationId,
+          user_id: user.id,
+          title: draft.title,
+          summary: draft.summary, // includes steps + FAQ refs
+          status: 'new',
+          priority: sevToPriority(draft.severity),
+        })
+        .select('id, title, status, priority, created_at')
+        .single();
+      if (tErr) throw new Error(tErr.message);
 
-  await supa.from('messages').insert({
-    conversation_id: conversationId,
-    role: 'assistant',
-    content: `I've created ticket #${ticket.id}: ${ticket.title}. Our team will follow up.`,
-  });
+      await supa.from('messages').insert({
+        conversation_id: conversationId,
+        role: 'assistant',
+        content: `I've created ticket #${ticket.id}: ${ticket.title}. Our team will follow up.`,
+      });
 
-  return NextResponse.json({
-    ok: true,
-    conversationId,
-    action: 'ticket_created',
-    ticket,
-    reply: `I've created ticket #${ticket.id}: ${ticket.title}.`,
-  });
-}
+      return NextResponse.json({
+        ok: true,
+        conversationId,
+        action: 'ticket_created',
+        ticket,
+        reply: `I've created ticket #${ticket.id}: ${ticket.title}.`,
+      });
+    }
 
     // Normal signed-in chat with persistence
     const results = await retrieveMatches(message);
