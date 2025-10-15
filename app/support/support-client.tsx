@@ -204,7 +204,7 @@ export default function SupportChatClient() {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-12 gap-4">
       {/* LEFT: Sidebar */}
-      <aside className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 shadow-sm flex flex-col h-[80vh]">
+      <aside className="sm:col-span-4 lg:col-span-3 rounded-2xl border p-3 shadow-sm h-[80vh]">
         <div className="mb-3 flex items-center justify-between gap-2">
           <button
             className="w-full rounded-xl bg-indigo-600 text-white px-3 py-2 hover:bg-indigo-700"
@@ -253,7 +253,7 @@ export default function SupportChatClient() {
       </aside>
 
       {/* RIGHT: Chat */}
-      <section className="flex flex-col h-[80vh]">
+      <section className="sm:col-span-8 lg:col-span-9 min-w-0 flex flex-col h-[80vh]">
         <div className="flex-1 overflow-y-auto rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-3 shadow-sm">
           {loadingConversation ? (
             <div className="text-sm text-slate-500">Loading conversation…</div>
