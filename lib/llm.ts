@@ -167,19 +167,28 @@ function buildSummaryText(d: TicketDraft): string {
   return lines.join('\n');
 }
 
+// --- UPDATED ---
 export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> {
-  const faqRefs = inferFaqRefsFromChat(chat);
+  // 1) Clean conversation (drop “create/open ticket” noise) + infer env
+  const cleaned = stripTicketCommands(chat);
+  const envHint = inferEnvironment(cleaned);
+
+  // 2) Collect any FAQ refs already present in the chat
+  const faqRefs = inferFaqRefsFromChat(cleaned);
+
+  // 3) Base draft (used for both fallback and LLM merge)
   const base: TicketDraft = {
-    title: heuristicTitle(chat),
+    title: heuristicTitle(cleaned),
     summary: '',
     severity: 'normal',
-    environment: 'unknown',
+    environment: envHint,
     steps: [],
     faq_refs: faqRefs,
   };
 
+  // 4) Fallback path (no Groq key available)
   if (!process.env.GROQ_API_KEY) {
-    const tail = messagesToPlain(chat, 12);
+    const tail = messagesToPlain(cleaned, 12);
     const draft: TicketDraft = {
       ...base,
       summary:
@@ -187,20 +196,21 @@ export async function summarizeForTicket(chat: ChatMsg[]): Promise<TicketDraft> 
         `Recent conversation:\n${tail}`,
       steps: ['Review conversation log', 'Respond according to policy'],
     };
-    draft.summary = buildSummaryText(draft);
+    draft.summary = buildSummaryText(draft); // human-friendly block incl. FAQ refs
     return draft;
   }
 
+  // 5) LLM path (concise, grounded JSON → merged into a readable summary)
   const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  const convo = messagesToPlain(chat, 50);
+  const convo = messagesToPlain(cleaned, 50);
 
   const system = `
 Create an internal support ticket from the chat transcript.
 
-Return STRICT JSON:
+Return STRICT JSON ONLY (no extra text):
 {
   "title": "concise issue (max 90 chars)",
-  "summary": "2-5 sentences: what the user needs, key constraints, policy refs if any",
+  "summary": "2-5 sentences: what the user needs, key constraints/policy context",
   "severity": "low|normal|high|critical",
   "environment": "web|ios|android|api|unknown",
   "steps": ["bullet 1", "bullet 2"],
@@ -208,10 +218,10 @@ Return STRICT JSON:
 }
 
 Rules:
-- Ground ONLY in transcript; do not invent order IDs or dates.
-- If not stated, use "unknown" or omit.
-- Prefer a task-like title (e.g., "Price adjustment request within 7 days"), never "Create New Ticket".
-- Extract numbers from tokens like [FAQ-123] into faq_refs (unique).
+- Ignore meta commands like "create/open ticket".
+- Ground ONLY in the transcript; do NOT invent order IDs, dates, or private data.
+- If environment is unclear, use "unknown" (you MAY infer from cues like 'browser', 'iOS', 'API key', etc.).
+- Extract FAQ numbers from tokens like [FAQ-123] into faq_refs (unique).
 - Keep JSON under 1200 chars.
 `.trim();
 
@@ -221,13 +231,14 @@ Rules:
     max_tokens: 700,
     messages: [
       { role: 'system', content: system },
-      { role: 'user', content: `Transcript:\n${convo}` },
+      { role: 'user', content: `Transcript:\n${convo}\n\nHint: environment seen so far = ${envHint}` },
     ],
   });
 
   const text = resp.choices?.[0]?.message?.content ?? '';
   const obj = parseJsonLoose(text) ?? {};
 
+  // Merge FAQ refs (dedupe)
   const mergedRefs = Array.from(
     new Set([
       ...faqRefs,
@@ -237,18 +248,42 @@ Rules:
     ])
   );
 
+  // Normalize severity & environment
+  const sev =
+    obj.severity && ['low', 'normal', 'high', 'critical'].includes(obj.severity)
+      ? (obj.severity as TicketDraft['severity'])
+      : base.severity;
+
+  const env = (obj.environment as TicketDraft['environment']) || base.environment;
+
   const draft: TicketDraft = {
     ...base,
     title: obj.title || base.title,
     summary: obj.summary || base.summary,
-    severity: ['low', 'normal', 'high', 'critical'].includes(obj.severity)
-      ? obj.severity
-      : base.severity,
-    environment: obj.environment || base.environment,
+    severity: sev,
+    environment: env,
     steps: Array.isArray(obj.steps) ? obj.steps.slice(0, 10) : [],
     faq_refs: mergedRefs,
   };
 
+  // Final human-readable block (Issue/Severity/Environment + summary + steps + FAQ refs)
   draft.summary = buildSummaryText(draft);
   return draft;
 }
+
+// lib/llm.ts — add these helpers near the top
+
+function stripTicketCommands(chat: ChatMsg[]): ChatMsg[] {
+  const re = /(open|create|raise|file|escalate).{0,20}ticket|^create ticket$|^open ticket$/i;
+  return chat.filter(m => !re.test(m.content.toLowerCase()));
+}
+
+function inferEnvironment(chat: ChatMsg[]): 'web' | 'ios' | 'android' | 'api' | 'unknown' {
+  const text = chat.map(m => m.content.toLowerCase()).join('  ');
+  if (/ios|iphone|ipad|testflight|apple id|safari \(ios\)/.test(text)) return 'ios';
+  if (/android|apk|play store|pixel|samsung|chrome \(android\)/.test(text)) return 'android';
+  if (/api key|webhook|curl|endpoint|http 4\d\d|json|postman/.test(text)) return 'api';
+  if (/browser|chrome|safari|edge|firefox|desktop|laptop|web app/.test(text)) return 'web';
+  return 'unknown';
+}
+
